@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & API credentials (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Logs & Temporary files
+*.log
+@AutomationLog.txt
+*.tmp
+temp/
+tmp/
+
+# Audio & Vision captures / scratch artifacts
+scratch/
+captures/
+*.wav
+*.pcm
+*.mp3
+*.aac
+*.webp
+*.raw
+
+# IDE & Editor specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Knowledge Graph / Tool-specific outputs
+graphify-out/
