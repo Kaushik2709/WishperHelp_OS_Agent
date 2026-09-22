@@ -12,8 +12,10 @@ import re
 from typing import Any, Dict, Optional
 
 from wisprhelp.classification.client import JevClient
+from wisprhelp.classification.decomposer import SemanticDecomposer
 from wisprhelp.classification.schemas import (
     JEV_QUESTIONS_SPEC,
+    DecomposedQuery,
     IntentType,
     JevDecision,
     TargetApp,
@@ -25,8 +27,13 @@ logger = logging.getLogger(__name__)
 class JevClassifier:
     """Classifies user goals into calibrated OS interaction decisions."""
 
-    def __init__(self, client: Optional[JevClient] = None) -> None:
+    def __init__(
+        self,
+        client: Optional[JevClient] = None,
+        decomposer: Optional[SemanticDecomposer] = None,
+    ) -> None:
         self.client = client or JevClient()
+        self.decomposer = decomposer or SemanticDecomposer()
 
     def classify(
         self,
@@ -59,21 +66,39 @@ class JevClassifier:
                 raw_response={},
             )
 
+        # 0. Pre-Jev Semantic Decomposition (Groq LPU / Deterministic Fallback)
+        decomposed: Optional[DecomposedQuery] = None
+        try:
+            decomposed = self.decomposer.decompose(cleaned_query, os_context)
+        except Exception as exc:
+            logger.warning("Semantic decomposition exception: %s", exc)
+
         context = {
             "user_query": cleaned_query,
             "os_platform": platform.system().lower(),
             **(os_context or {}),
         }
+        if decomposed:
+            context["is_compound"] = decomposed.is_compound
+            if decomposed.target_app:
+                context["target_app_hint"] = decomposed.target_app
+            context["normalized_intent"] = decomposed.normalized_intent
 
         try:
             raw = self.client.evaluate(state=context, questions=JEV_QUESTIONS_SPEC)
-            return self._parse_response(raw)
+            decision = self._parse_response(raw, decomposed)
         except Exception as exc:
             logger.error("TypeSafe JEV API evaluation failed: %s. Using local fallback.", exc)
-            return self._offline_fallback_classify(cleaned_query, context)
+            decision = self._offline_fallback_classify(cleaned_query, context, decomposed)
 
-    def _parse_response(self, raw: Dict[str, Any]) -> JevDecision:
-        """Parses raw JEV response into typed JevDecision dataclass."""
+        return decision
+
+    def _parse_response(
+        self,
+        raw: Dict[str, Any],
+        decomposed: Optional[DecomposedQuery] = None,
+    ) -> JevDecision:
+        """Parses raw JEV response into typed JevDecision dataclass with calibrated confidence."""
         answers = raw.get("answers", {})
 
         # 1. Intent (Choice)
@@ -101,6 +126,18 @@ class JevClassifier:
         multi_prob = float(multi_data.get("noul", 0.0))
         has_multilingual = multi_prob >= 0.50
 
+        # Boost confidence & resolve target app if decomposed plan provides high certainty
+        if decomposed:
+            if decomposed.is_compound:
+                intent = IntentType.GUI_WORKFLOW_AUTOMATION.value
+                intent_conf = max(intent_conf, 0.95)
+                comp_score = max(comp_score, 2.0)
+            if decomposed.target_app and target_app == TargetApp.GENERIC_OR_ACTIVE.value:
+                mapped = self._map_app_to_target_enum(decomposed.target_app)
+                if mapped != TargetApp.GENERIC_OR_ACTIVE.value:
+                    target_app = mapped
+                    app_conf = max(app_conf, 0.92)
+
         return JevDecision(
             intent=intent,
             intent_confidence=intent_conf,
@@ -113,12 +150,36 @@ class JevClassifier:
             has_multilingual_content=has_multilingual,
             multilingual_probability=multi_prob,
             raw_response=raw,
+            decomposed_plan=decomposed,
         )
+
+    @staticmethod
+    def _map_app_to_target_enum(app_name: Optional[str]) -> str:
+        """Maps canonical application name string to TargetApp enum value."""
+        if not app_name:
+            return TargetApp.GENERIC_OR_ACTIVE.value
+        low = app_name.lower()
+        if "whatsapp" in low:
+            return TargetApp.WHATSAPP.value
+        if any(b in low for b in ("chrome", "browser", "edge", "firefox", "brave", "opera", "safari")):
+            return TargetApp.BROWSER.value
+        if any(s in low for s in ("store", "market")):
+            return TargetApp.APP_STORE.value
+        if any(t in low for t in ("code", "terminal", "powershell", "cmd", "bash", "ide")):
+            return TargetApp.TERMINAL_CODE.value
+        if any(f in low for f in ("file", "explorer", "finder", "directory")):
+            return TargetApp.FILE_MANAGER.value
+        if any(m in low for m in ("media", "spotify", "music", "player", "youtube")):
+            return TargetApp.MEDIA_PLAYER.value
+        if any(s in low for s in ("setting", "control panel", "config")):
+            return TargetApp.SYSTEM_SETTINGS.value
+        return TargetApp.GENERIC_OR_ACTIVE.value
 
     def _offline_fallback_classify(
         self,
         query: str,
         context: Dict[str, Any],
+        decomposed: Optional[DecomposedQuery] = None,
     ) -> JevDecision:
         """Rule-based offline heuristic classifier for offline graceful degradation."""
         lower_query = query.lower()
@@ -134,8 +195,30 @@ class JevClassifier:
         is_destructive = any(kw in lower_query for kw in destructive_keywords)
         dest_prob = 0.95 if is_destructive else 0.05
 
+        # If semantic decomposer identified compound workflow, prioritize high confidence
+        if decomposed and decomposed.is_compound:
+            tgt_app = self._map_app_to_target_enum(decomposed.target_app)
+            return JevDecision(
+                intent=IntentType.GUI_WORKFLOW_AUTOMATION.value,
+                intent_confidence=0.95,
+                target_app=tgt_app,
+                target_app_confidence=0.92,
+                complexity_score=2.0,
+                complexity_confidence=0.90,
+                is_destructive=is_destructive,
+                destructive_probability=dest_prob,
+                has_multilingual_content=has_non_ascii,
+                multilingual_probability=0.95 if has_non_ascii else 0.05,
+                raw_response={"fallback": True},
+                decomposed_plan=decomposed,
+            )
+
         # Volume / System media patterns
-        media_keywords = ["volume", "mute", "unmute", "brightness", "pause", "play next", "lock screen"]
+        media_keywords = [
+            "volume", "vol", "sound", "awaaz", "audio", "percent", "%",
+            "mute", "unmute", "brightness", "pause", "play next", "lock screen",
+            "louder", "quieter",
+        ]
         if any(kw in lower_query for kw in media_keywords):
             return JevDecision(
                 intent=IntentType.SYSTEM_MEDIA_CONTROL.value,
@@ -181,8 +264,9 @@ class JevClassifier:
                 raw_response={"fallback": True},
             )
 
-        # Typing patterns
-        if lower_query.startswith(("type ", "write ", "लिखो ", "टाइप करो ")):
+        # Typing patterns (strictly excluded if click/button terms present)
+        is_click = any(w in lower_query for w in ("click", "press", "tap", "select", "button", "btn", "tab", "chat", "icon"))
+        if not is_click and lower_query.startswith(("type ", "write ", "लिखो ", "टाइप करो ")):
             return JevDecision(
                 intent=IntentType.TEXT_INPUT_INJECTION.value,
                 intent_confidence=0.88,
@@ -218,4 +302,5 @@ class JevClassifier:
             has_multilingual_content=has_non_ascii,
             multilingual_probability=0.95 if has_non_ascii else 0.05,
             raw_response={"fallback": True},
+            decomposed_plan=decomposed,
         )

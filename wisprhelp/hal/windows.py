@@ -215,32 +215,6 @@ class WindowsOSAdapter(BaseOSAdapter):
         target = app_identifier.strip()
         lower_target = target.lower()
 
-        # --- Layer 0: Bring Existing Running Window to Foreground (< 10ms) ---
-        if HAS_WIN32:
-            try:
-                active_win = self.get_active_window()
-                if lower_target in active_win.title.lower() or lower_target in active_win.process_name.lower():
-                    logger.info("Layer 0: App '%s' is already active in foreground.", target)
-                    return True
-
-                matching_hwnds = []
-                def _enum_callback(hwnd, extra):
-                    if win32gui.IsWindowVisible(hwnd):
-                        w_title = win32gui.GetWindowText(hwnd).lower()
-                        if lower_target in w_title:
-                            matching_hwnds.append(hwnd)
-                    return True
-
-                win32gui.EnumWindows(_enum_callback, None)
-                if matching_hwnds:
-                    target_hwnd = matching_hwnds[0]
-                    win32gui.ShowWindow(target_hwnd, win32con.SW_RESTORE)
-                    win32gui.SetForegroundWindow(target_hwnd)
-                    logger.info("Layer 0: Brought existing window to foreground: '%s' (hwnd=%s)", target, target_hwnd)
-                    return True
-            except Exception as exc:
-                logger.debug("Layer 0 activate existing window failed: %s", exc)
-
         # --- Layer 1: Protocol schemes & common aliases (< 10ms) ---
         protocol_map = {
             "whatsapp": "whatsapp:",
@@ -256,9 +230,6 @@ class WindowsOSAdapter(BaseOSAdapter):
             "visual studio code": "vscode:",
             "code": "vscode:",
             "terminal_code": "vscode:",
-            "antigravity": "vscode:",
-            "cursor": "cursor:",
-            "pycharm": "pycharm:",
             "edge": "microsoft-edge:",
             "microsoft edge": "microsoft-edge:",
             "msedge": "microsoft-edge:",
@@ -426,37 +397,76 @@ class WindowsOSAdapter(BaseOSAdapter):
 
         try:
             pyperclip.copy(text)
-            time.sleep(0.08)  # Ensure clipboard buffer update
+            time.sleep(0.04)  # Ensure clipboard buffer update
             if HAS_WIN32:
                 # Use native Win32 keyboard events for instantaneous paste
                 VK_CONTROL = 0x11
                 VK_V = 0x56
                 win32api.keybd_event(VK_CONTROL, 0, 0, 0)
                 win32api.keybd_event(VK_V, 0, 0, 0)
-                time.sleep(0.04)
+                time.sleep(0.02)
                 win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
                 win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
             else:
                 pyautogui.hotkey("ctrl", "v")
-            time.sleep(0.08)
+            time.sleep(0.04)
             return True
         except Exception as exc:
             logger.error("Failed to inject unicode text via clipboard: %s", exc)
             return False
         finally:
-            # Restore original clipboard after app has finished consuming it
+            # Restore original clipboard
             try:
-                time.sleep(0.20)
+                time.sleep(0.1)
                 pyperclip.copy(old_clipboard)
             except Exception:
                 pass
 
     def media_control(self, command: str) -> bool:
-        """Sends native Windows multimedia virtual key events."""
+        """Sends native Windows multimedia events or sets master volume scalar via pycaw."""
         if not HAS_WIN32:
             return False
 
         cmd = command.lower().strip()
+
+        # Handle exact volume percentage scaling via pycaw: set_volume:<pct>
+        if cmd.startswith("set_volume:"):
+            try:
+                pct_str = cmd.split(":", 1)[1]
+                pct = max(0, min(100, int(pct_str)))
+                try:
+                    from pycaw.pycaw import AudioUtilities
+                    speakers = AudioUtilities.GetSpeakers()
+                    endpoint = speakers.EndpointVolume
+                    endpoint.SetMasterVolumeLevelScalar(pct / 100.0, None)
+                    logger.info("Set Windows master volume to %d%% via pycaw.", pct)
+                    return True
+                except Exception as pycaw_exc:
+                    logger.warning("pycaw volume adjustment failed: %s; trying key fallback.", pycaw_exc)
+            except Exception as exc:
+                logger.error("Error parsing volume target: %s", exc)
+                return False
+
+        # Handle relative volume adjustment via pycaw: adjust_volume:<delta>
+        if cmd.startswith("adjust_volume:"):
+            try:
+                delta_str = cmd.split(":", 1)[1]
+                delta = int(delta_str)
+                try:
+                    from pycaw.pycaw import AudioUtilities
+                    speakers = AudioUtilities.GetSpeakers()
+                    endpoint = speakers.EndpointVolume
+                    current = endpoint.GetMasterVolumeLevelScalar()
+                    new_val = max(0.0, min(1.0, current + (delta / 100.0)))
+                    endpoint.SetMasterVolumeLevelScalar(new_val, None)
+                    logger.info("Adjusted Windows master volume from %d%% to %d%% via pycaw.", int(current * 100), int(new_val * 100))
+                    return True
+                except Exception as pycaw_exc:
+                    logger.warning("pycaw relative volume failed: %s", pycaw_exc)
+            except Exception as exc:
+                logger.error("Error parsing volume delta: %s", exc)
+                return False
+
         vk_map = {
             "mute": VK_VOLUME_MUTE,
             "unmute": VK_VOLUME_MUTE,
@@ -485,6 +495,115 @@ class WindowsOSAdapter(BaseOSAdapter):
         except Exception as exc:
             logger.error("Error dispatching media key %s: %s", cmd, exc)
             return False
+
+    def find_ordinal_element(
+        self, ordinal_index: int, item_type: str = "item", target_app: Optional[str] = None
+    ) -> Optional[Tuple[int, int]]:
+        """Finds the coordinates of a list/row/tab item at the specified ordinal position.
+
+        Args:
+            ordinal_index: 0=first, 1=second, 2=third, -1=last, -2=second-last, etc.
+            item_type: 'chat', 'item', 'row', 'tab', 'button', etc.
+            target_app: Target application name if available.
+
+        Returns:
+            Center coordinates (x, y) if found, else None.
+        """
+        if not HAS_UIA:
+            return None
+
+        try:
+            root = None
+            if HAS_WIN32:
+                try:
+                    hwnd = win32gui.GetForegroundWindow()
+                    if hwnd:
+                        root = auto.ControlFromHandle(hwnd)
+                except Exception:
+                    pass
+            if not root:
+                root = auto.GetForegroundControl()
+            if not root:
+                root = auto.GetRootControl()
+
+            candidates: List[auto.Control] = []
+            item_type_lower = (item_type or "item").lower()
+
+            def _collect_items(ctrl: auto.Control, depth: int) -> bool:
+                ctrl_type = (ctrl.ControlTypeName or "").lower()
+                rect = ctrl.BoundingRectangle
+                w, h = rect.width(), rect.height()
+
+                # Basic sanity check: visible on screen
+                if w <= 10 or h <= 10 or rect.top < 0 or rect.left < 0:
+                    return False
+
+                # Chat / List item matching
+                if item_type_lower in ("chat", "conversation", "contact", "item", "row", "message"):
+                    if any(t in ctrl_type for t in ("listitem", "custom", "dataitem", "pane")):
+                        if w >= 80 and 20 <= h <= 200:
+                            candidates.append(ctrl)
+                elif item_type_lower in ("tab", "tabitem"):
+                    if "tabitem" in ctrl_type or ("button" in ctrl_type and h <= 50):
+                        candidates.append(ctrl)
+                elif item_type_lower in ("button", "btn"):
+                    if "button" in ctrl_type:
+                        candidates.append(ctrl)
+                else:
+                    if any(t in ctrl_type for t in ("listitem", "custom", "dataitem", "button")):
+                        if w >= 60 and 20 <= h <= 200:
+                            candidates.append(ctrl)
+                return False
+
+            auto.WalkControl(root, _collect_items, maxDepth=12)
+
+            if not candidates:
+                logger.info("No candidates found for ordinal element type '%s'", item_type)
+                return None
+
+            # Deduplicate items with identical or nearly identical bounding boxes
+            unique_candidates: List[auto.Control] = []
+            seen_boxes = set()
+            for c in candidates:
+                r = c.BoundingRectangle
+                box_key = (r.left // 5, r.top // 5, r.width() // 5, r.height() // 5)
+                if box_key not in seen_boxes:
+                    seen_boxes.add(box_key)
+                    unique_candidates.append(c)
+
+            # Sort primarily vertically (by top), secondarily horizontally (by left)
+            if item_type_lower in ("tab", "tabitem"):
+                unique_candidates.sort(key=lambda c: (c.BoundingRectangle.top // 15, c.BoundingRectangle.left))
+            else:
+                unique_candidates.sort(key=lambda c: (c.BoundingRectangle.top, c.BoundingRectangle.left))
+
+            total = len(unique_candidates)
+            logger.info("Found %d candidate controls for ordinal index %d (type='%s')", total, ordinal_index, item_type)
+
+            selected_ctrl = None
+            if ordinal_index >= 0 and ordinal_index < total:
+                selected_ctrl = unique_candidates[ordinal_index]
+            elif ordinal_index < 0 and abs(ordinal_index) <= total:
+                selected_ctrl = unique_candidates[ordinal_index]
+            elif ordinal_index >= total and total > 0:
+                selected_ctrl = unique_candidates[-1]
+            elif abs(ordinal_index) > total and total > 0:
+                selected_ctrl = unique_candidates[0]
+
+            if selected_ctrl:
+                r = selected_ctrl.BoundingRectangle
+                cx = r.left + r.width() // 2
+                cy = r.top + r.height() // 2
+                logger.info(
+                    "Selected ordinal [%d] item (name='%s', type='%s') at (%d, %d)",
+                    ordinal_index, selected_ctrl.Name, selected_ctrl.ControlTypeName, cx, cy
+                )
+                return (cx, cy)
+
+        except Exception as exc:
+            logger.debug("Error in find_ordinal_element: %s", exc)
+
+        return None
 
     def find_accessibility_element(
         self, query: str, control_type: Optional[str] = None
@@ -567,6 +686,7 @@ class WindowsOSAdapter(BaseOSAdapter):
             logger.debug("Priority 2 UIA traversal error for '%s': %s", query, exc)
 
         return None
+
 
     def move_mouse(self, x: int, y: int, smooth: bool = True) -> None:
         """Moves cursor to pixel coordinate (x, y)."""

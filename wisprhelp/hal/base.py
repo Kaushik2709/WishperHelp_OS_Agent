@@ -82,6 +82,22 @@ class BaseOSAdapter(ABC):
         """
         pass
 
+    def find_ordinal_element(
+        self, ordinal_index: int, item_type: str = "item", target_app: Optional[str] = None
+    ) -> Optional[Tuple[int, int]]:
+        """Searches OS accessibility tree for an item at an ordinal position (0=first, 1=second, -1=last, -2=second-last).
+
+        Args:
+            ordinal_index: 0-based or negative index from the end.
+            item_type: 'chat', 'item', 'row', 'tab', 'button', etc.
+            target_app: Optional target application name.
+
+        Returns:
+            Center coordinates (x, y) if located, else None.
+        """
+        return None
+
+
     @abstractmethod
     def move_mouse(self, x: int, y: int, smooth: bool = True) -> None:
         """Moves cursor to pixel coordinates (x, y)."""

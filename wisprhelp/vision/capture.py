@@ -34,13 +34,19 @@ class ScreenFrame:
     def to_base64_jpeg(self, quality: int = 80) -> str:
         """Converts frame to compact base64 JPEG string for VLM payload."""
         buffer = io.BytesIO()
-        self.image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        img_to_save = self.image
+        if img_to_save.mode != "RGB":
+            img_to_save = img_to_save.convert("RGB")
+        img_to_save.save(buffer, format="JPEG", quality=quality, optimize=True)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def to_bytes(self, format: str = "JPEG", quality: int = 80) -> bytes:
         """Converts frame to in-memory bytes."""
         buffer = io.BytesIO()
-        self.image.save(buffer, format=format, quality=quality, optimize=True)
+        img_to_save = self.image
+        if format.upper() in ("JPEG", "JPG") and img_to_save.mode != "RGB":
+            img_to_save = img_to_save.convert("RGB")
+        img_to_save.save(buffer, format=format, quality=quality, optimize=True)
         return buffer.getvalue()
 
 

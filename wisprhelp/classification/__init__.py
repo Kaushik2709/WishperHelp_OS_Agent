@@ -2,10 +2,13 @@
 
 from wisprhelp.classification.classifier import JevClassifier
 from wisprhelp.classification.client import JevClient, JevAPIError
+from wisprhelp.classification.decomposer import SemanticDecomposer
 from wisprhelp.classification.schemas import (
     IntentType,
     TargetApp,
     JevDecision,
+    DecomposedQuery,
+    DecomposedStep,
     JEV_QUESTIONS_SPEC,
 )
 
@@ -13,6 +16,9 @@ __all__ = [
     "JevClassifier",
     "JevClient",
     "JevAPIError",
+    "SemanticDecomposer",
+    "DecomposedQuery",
+    "DecomposedStep",
     "IntentType",
     "TargetApp",
     "JevDecision",

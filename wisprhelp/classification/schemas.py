@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 class IntentType(str, Enum):
@@ -80,6 +80,28 @@ JEV_QUESTIONS_SPEC: Dict[str, Dict[str, Any]] = {
 
 
 @dataclass(frozen=True)
+class DecomposedStep:
+    """An atomic sub-action extracted from a compound user command."""
+
+    step_number: int
+    query_text: str
+    action_type: str  # "launch", "in_app_search", "click_element", "type_text", "media_control", "keyboard_shortcut"
+    target: Optional[str] = None
+    payload: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DecomposedQuery:
+    """Structured semantic decomposition of a user query produced by Groq or fallback heuristic."""
+
+    original_query: str
+    target_app: Optional[str] = None
+    is_compound: bool = False
+    normalized_intent: str = IntentType.GUI_WORKFLOW_AUTOMATION.value
+    sub_queries: List[DecomposedStep] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class JevDecision:
     """Calibrated decision object returned by TypeSafe Jev classification."""
 
@@ -94,6 +116,7 @@ class JevDecision:
     has_multilingual_content: bool
     multilingual_probability: float
     raw_response: Dict[str, Any] = field(default_factory=dict)
+    decomposed_plan: Optional[DecomposedQuery] = None
 
     def is_high_risk(self, threshold: float = 0.65) -> bool:
         """Checks if the action has an unacceptably high destructive probability."""

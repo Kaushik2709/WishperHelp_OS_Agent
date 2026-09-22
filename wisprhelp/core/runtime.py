@@ -60,12 +60,14 @@ class RuntimeCoordinator:
         self,
         user_query: str,
         confirmation_response: Optional[str] = None,
+        decision: Optional[JevDecision] = None,
     ) -> ExecutionResult:
         """Processes a natural language command from start to finish.
 
         Args:
             user_query: Spoken or typed command from the user.
             confirmation_response: Optional affirmative reply if answering a safety prompt.
+            decision: Optional pre-classified JevDecision.
 
         Returns:
             ExecutionResult describing the action taken and performance metrics.
@@ -100,17 +102,18 @@ class RuntimeCoordinator:
         }
 
         # 2. System One Evaluation via TypeSafe Jev (~100-150ms)
-        decision = self.classifier.classify(user_query, os_context=context)
+        if decision is None:
+            decision = self.classifier.classify(user_query, os_context=context)
 
         # 3. Confidence & Risk Routing
         route, reason = self.router.route(decision)
 
-        # Compound command resolution: If router flagged CLARIFY due to split confidence across
-        # multi-actions, but the user explicitly specified both target app and in-app action,
-        # promote to GUI_WORKFLOW_AUTOMATION so the user's intent is carried out.
+        # Compound command resolution: If router flagged CLARIFY or PRIORITY_1_LAUNCH,
+        # but the query contains compound actions, promote to GUI_WORKFLOW_AUTOMATION.
         parsed_app, in_app_cmd = self._parse_app_and_command(user_query, decision.target_app)
-        if route == RouteTarget.CLARIFY and in_app_cmd:
-            logger.info("Promoting CLARIFY to GUI_WORKFLOW_AUTOMATION for compound query: '%s'", user_query)
+        has_compound_plan = bool(decision.decomposed_plan and decision.decomposed_plan.is_compound)
+        if (route in (RouteTarget.CLARIFY, RouteTarget.PRIORITY_1_LAUNCH)) and (in_app_cmd or has_compound_plan):
+            logger.info("Promoting route '%s' to GUI_WORKFLOW_AUTOMATION for compound query: '%s'", route.value, user_query)
             route = RouteTarget.GUI_WORKFLOW_AUTOMATION
 
         # 4. Dispatch by Selected Route
@@ -173,24 +176,41 @@ class RuntimeCoordinator:
                 latency_ms=elapsed,
             )
 
-        if route == RouteTarget.PRIORITY_1_MEDIA:
+        # Check for media/volume command override before other pathways
+        lower_q = user_query.lower()
+        is_volume_query = bool(
+            re.search(r"\b(?:volume|vol|sound|audio|awaaz)\b", lower_q)
+            and re.search(r"\b(?:\d{1,3}|up|down|mute|unmute|quieter|louder|increase|decrease|lower|raise)\b", lower_q)
+        )
+
+        if route == RouteTarget.PRIORITY_1_MEDIA or is_volume_query:
             media_cmd = self._extract_media_command(user_query)
+            display_msg = f"Volume: {media_cmd.split(':')[1]}%" if media_cmd.startswith("set_volume:") else f"Media: {media_cmd}"
             if self.hud:
-                self.hud.set_state(HUDState.EXECUTING, f"Media: {media_cmd}")
+                self.hud.set_state(HUDState.EXECUTING, display_msg)
             ok = self.os_adapter.media_control(media_cmd)
             elapsed = (time.perf_counter() - start_time) * 1000
-            msg = f"Priority 1: Executed media command '{media_cmd}'."
+            msg = f"Priority 1: Set volume to {media_cmd.split(':')[1]}%." if media_cmd.startswith("set_volume:") else f"Priority 1: Executed media command '{media_cmd}'."
             if self.hud:
                 self.hud.set_state(HUDState.IDLE, "Ready")
             if self.feedback:
                 self.feedback.play_success()
             return ExecutionResult(
                 success=ok,
-                route=route,
+                route=RouteTarget.PRIORITY_1_MEDIA,
                 message=msg,
                 decision=decision,
                 latency_ms=elapsed,
             )
+
+        # Safety Gate: Prevent Click / Button / Tab / UI actions from ever being misrouted to Text Injection
+        is_click_action = bool(
+            re.search(r"\b(?:click(?:\s+on)?|press|tap|hit|select|push|daba|dabao|क्लिक)\b", lower_q)
+            or re.search(r"\b(?:button|btn|tab|icon|checkbox|link|chat)\b", lower_q)
+        )
+        if route == RouteTarget.TEXT_INJECTION and is_click_action:
+            logger.info("Overriding TEXT_INJECTION to GUI_WORKFLOW_AUTOMATION because query contains click action: '%s'", user_query)
+            route = RouteTarget.GUI_WORKFLOW_AUTOMATION
 
         if route == RouteTarget.TEXT_INJECTION:
             text_to_type = self._extract_text_content(user_query)
@@ -276,6 +296,22 @@ class RuntimeCoordinator:
         """Cascades through Priority 1 (Launch), Human-like In-App Actions, Priority 2 (UIA), and Priority 3 (Vision)."""
         target_app, in_app_cmd = self._parse_app_and_command(user_query, decision.target_app)
 
+        # Leverage structured decomposed plan if available from Groq/Heuristic pre-processor
+        if decision.decomposed_plan and decision.decomposed_plan.is_compound:
+            plan = decision.decomposed_plan
+            if plan.target_app:
+                target_app = plan.target_app
+            if len(plan.sub_queries) > 1:
+                step2 = plan.sub_queries[1]
+                if step2.action_type == "in_app_search" and step2.payload:
+                    in_app_cmd = f"search for {step2.payload}"
+                elif step2.action_type == "type_text" and step2.payload:
+                    in_app_cmd = f"type {step2.payload}"
+                elif step2.action_type == "click_element" and step2.payload:
+                    in_app_cmd = f"click {step2.payload}"
+                elif step2.query_text:
+                    in_app_cmd = step2.query_text
+
         # Step 1: Ensure target app is launched and focused (Priority 1)
         if target_app and target_app != TargetApp.GENERIC_OR_ACTIVE.value:
             if self.hud:
@@ -339,13 +375,43 @@ class RuntimeCoordinator:
         cmd_lower = cmd_clean.lower()
         app_lower = (app_name or "").lower()
 
-        # 0. Button / Control Click Action (Click Enter, Accept Changes, Save, etc.)
+        # 0. Button / Control / List / Chat Click Action
         is_click = bool(
             re.search(r"\b(?:click(?:\s+on)?|press|tap|hit|select|push|daba|dabao|क्लिक)\b", cmd_lower)
-            or re.search(r"\b(?:button|btn|tab|icon|checkbox|link)\b", cmd_lower)
+            or re.search(r"\b(?:button|btn|tab|icon|checkbox|link|chat|item|row)\b", cmd_lower)
         )
 
         if is_click:
+            # Check for ordinal / positional reference (e.g. "click on the first chat on WhatsApp", "click second-last chat")
+            ordinal_info = self._parse_ordinal_target(cmd_clean)
+            if ordinal_info:
+                ord_idx, itype = ordinal_info
+                ord_labels = {0: "first", 1: "second", 2: "third", -1: "last", -2: "second-last", -3: "third-last"}
+                ord_label = ord_labels.get(ord_idx, f"item {ord_idx}")
+                logger.info("Human-like click action: Ordinal target [%s] %s in '%s'", ord_label, itype, app_name)
+
+                coords = self.os_adapter.find_ordinal_element(ord_idx, item_type=itype, target_app=app_name)
+                if coords:
+                    logger.info("Priority 2 UIA found ordinal [%s] %s at %s. Clicking.", ord_label, itype, coords)
+                    self.os_adapter.click(coords[0], coords[1])
+                    return ExecutionResult(
+                        success=True,
+                        route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                        message=f"Interacted with {ord_label} {itype} at {coords} in {app_name or 'active window'}.",
+                        decision=decision,
+                    )
+                else:
+                    logger.info("Priority 2 UIA could not locate ordinal [%s] %s. Escalating to Priority 3 Vision Grounding.", ord_label, itype)
+                    if self.hud:
+                        self.hud.set_state(HUDState.THINKING, f"Vision: Finding {ord_label} {itype}")
+                    vlm_res = self.vlm_agent.execute_visual_task(goal=cmd_clean, target_app=app_name)
+                    return ExecutionResult(
+                        success=vlm_res.success,
+                        route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                        message=f"Priority 3 Vision: {vlm_res.message} (steps: {vlm_res.steps_taken})",
+                        decision=decision,
+                    )
+
             button_candidates = self._extract_button_or_control_name(cmd_clean)
             logger.info("Human-like click action: Attempting to click control candidates %s in '%s'", button_candidates, app_name)
 
@@ -389,13 +455,22 @@ class RuntimeCoordinator:
         is_browser = any(b in app_lower for b in ["browser", "chrome", "edge", "brave", "firefox", "opera"])
         is_search = any(cmd_lower.startswith(w) for w in ["search for", "search", "look up", "find", "google", "go to", "visit", "open url", "navigate to"])
 
-        if is_browser or is_search:
-            search_query = re.sub(
-                r"^(search\s+for|search|look\s+up|find|google|go\s+to|visit|open\s+url|navigate\s+to)\s+",
-                "",
-                cmd_clean,
-                flags=re.IGNORECASE,
-            ).strip()
+        # Prioritize explicit payload from decomposed plan if available
+        search_query = None
+        if decision.decomposed_plan and len(decision.decomposed_plan.sub_queries) > 1:
+            for s in decision.decomposed_plan.sub_queries:
+                if s.action_type == "in_app_search" and s.payload:
+                    search_query = s.payload
+                    break
+
+        if is_browser or is_search or search_query:
+            if not search_query:
+                search_query = re.sub(
+                    r"^(search\s+for|search|look\s+up|find|google|go\s+to|visit|open\s+url|navigate\s+to)\s+",
+                    "",
+                    cmd_clean,
+                    flags=re.IGNORECASE,
+                ).strip()
             if search_query:
                 logger.info("Human-like browser action: Focusing address bar and searching for '%s'", search_query)
                 self.os_adapter.key_combination(["ctrl", "l"])
@@ -411,7 +486,7 @@ class RuntimeCoordinator:
                 )
 
         # 2. File Creation & Code Editing (VS Code, Cursor, Notepad, Word, Sublime, Editor)
-        is_editor = any(e in app_lower for e in ["notepad", "word", "notes", "editor", "text", "docs", "vscode", "code", "sublime", "pycharm", "cursor", "antigravity"])
+        is_editor = any(e in app_lower for e in ["notepad", "word", "notes", "editor", "text", "docs", "vscode", "code", "sublime", "pycharm", "cursor"])
         is_file_creation = bool(re.search(r"\b(?:create|make|new|open)\s+(?:a\s+)?(?:new\s+)?file\b", cmd_lower))
 
         if is_editor and is_file_creation:
@@ -452,13 +527,21 @@ class RuntimeCoordinator:
             )
 
         # 3. Text Typing & Note Taking (Notepad, Word, Editor, Chat)
-        is_typing = any(cmd_lower.startswith(w) for w in ["type", "write", "dictate", "enter text", "paste", "लिखो", "टाइप करो"]) or decision.is_text_injection()
+        is_typing = any(cmd_lower.startswith(w) for w in ["type", "write", "dictate", "enter", "paste", "लिखो", "टाइप करो"])
 
-        if is_typing and not is_click:
-            text_to_type = self._extract_text_content(cmd_clean)
+        # Prioritize explicit text payload from decomposed plan if available
+        text_from_plan = None
+        if decision.decomposed_plan and len(decision.decomposed_plan.sub_queries) > 1:
+            for s in decision.decomposed_plan.sub_queries:
+                if s.action_type == "type_text" and s.payload:
+                    text_from_plan = s.payload
+                    break
+
+        if is_editor or is_typing or text_from_plan:
+            text_to_type = text_from_plan or self._extract_text_content(cmd_clean)
             if text_to_type:
                 logger.info("Human-like text action: Injecting text into '%s': '%s'", app_name, text_to_type)
-                time.sleep(0.35)  # Allow target window focus to settle
+                time.sleep(0.15)
                 ok = self.os_adapter.inject_unicode_text(text_to_type)
                 if "and press enter" in cmd_lower or "send" in cmd_lower:
                     time.sleep(0.05)
@@ -563,6 +646,8 @@ class RuntimeCoordinator:
             candidates.extend(["Enter", "Send", "Submit"])
         elif target_lower in ("send", "submit"):
             candidates.extend(["Send", "Submit", "Enter"])
+        elif target_lower in ("show mode", "show more") or "show mode" in target_lower or "show more" in target_lower:
+            candidates.extend(["Show more", "Show More", "AI Mode", "More"])
 
         seen = set()
         deduped = []
@@ -591,23 +676,105 @@ class RuntimeCoordinator:
         return result
 
     @staticmethod
+    def _parse_ordinal_target(cmd: str) -> Optional[Tuple[int, str]]:
+        """Parses ordinal references like 'first chat', 'second-last item', '3rd tab'.
+
+        Returns:
+            Tuple of (ordinal_index, item_type) e.g. (0, 'chat'), (-2, 'chat'), or None.
+        """
+        lower = cmd.lower().strip()
+        item_types = r"(?:chat|conversation|message|contact|item|row|element|tab|button|entry|email|link)"
+
+        # Second-last / third-last / penultimate / aakhri
+        m_neg = re.search(
+            rf"\b(?:the\s+)?(?:(second|2nd|doosra)|(third|3rd|teesra)|(fourth|4th|chautha))\s*(?:to\s+|-)?\s*last\s+({item_types})\b",
+            lower,
+        )
+        if m_neg:
+            prefix = (m_neg.group(1) or m_neg.group(2) or m_neg.group(3) or "").lower()
+            itype = m_neg.group(4)
+            if any(w in prefix for w in ("second", "2nd", "doosra")):
+                return (-2, itype)
+            elif any(w in prefix for w in ("third", "3rd", "teesra")):
+                return (-3, itype)
+            elif any(w in prefix for w in ("fourth", "4th", "chautha")):
+                return (-4, itype)
+
+        m_pen = re.search(rf"\b(?:penultimate)\s+({item_types})\b", lower)
+        if m_pen:
+            return (-2, m_pen.group(1))
+
+        m_last = re.search(rf"\b(?:the\s+)?(?:last|aakhri|bottom)\s+({item_types})\b", lower)
+        if m_last:
+            return (-1, m_last.group(1))
+
+        # Positive ordinals: first, second, 3rd, etc.
+        pos_map = {
+            "first": 0, "1st": 0, "top": 0, "pehla": 0, "1": 0,
+            "second": 1, "2nd": 1, "doosra": 1, "2": 1,
+            "third": 2, "3rd": 2, "teesra": 2, "3": 2,
+            "fourth": 3, "4th": 3, "chautha": 3, "4": 3,
+            "fifth": 4, "5th": 4, "paanchwa": 4, "5": 4,
+            "sixth": 5, "6th": 5, "6": 5,
+            "seventh": 6, "7th": 6, "7": 6,
+            "eighth": 7, "8th": 7, "8": 7,
+            "ninth": 8, "9th": 8, "9": 8,
+            "tenth": 9, "10th": 9, "10": 9,
+        }
+        for word, idx in pos_map.items():
+            pattern = rf"\b(?:the\s+)?{re.escape(word)}\s+({item_types})\b"
+            m_pos = re.search(pattern, lower)
+            if m_pos:
+                return (idx, m_pos.group(1))
+
+        return None
+
+    @staticmethod
     def _extract_media_command(query: str) -> str:
-        """Extracts standard media command key."""
+        """Extracts standard media command key or target volume percentage."""
         lower = query.lower()
+
+        # 1. Exact volume percentage matching: "put the volume to 60%", "volume 100%", "lower volume to 30%"
+        m_pct = (
+            re.search(r"\b(?:set|put|turn|change|make|adjust|bring)?\s*(?:the\s+)?(?:volume|vol|sound|audio|awaaz)\s*(?:level|to|at|ko|pe|par)?\s*(\d{1,3})\s*(?:%|percent)?\b", lower)
+            or re.search(r"\b(\d{1,3})\s*(?:%|percent)\s*(?:volume|vol|sound|audio|awaaz)?\b", lower)
+            or re.search(r"\b(?:volume|vol|awaaz)\s*(?:to|at|ko|pe|par)?\s*(\d{1,3})\b", lower)
+        )
+        if m_pct:
+            val = int(m_pct.group(1))
+            if 0 <= val <= 100:
+                return f"set_volume:{val}"
+
+        # 2. Relative percentage adjustment: "increase volume by 20%", "lower volume by 10%"
+        m_rel = re.search(r"\b(increase|raise|boost|turn up|lower|decrease|reduce|turn down)\s+(?:the\s+)?(?:volume|vol|sound|audio|awaaz)\s+(?:by\s+)?(\d{1,3})\s*(?:%|percent)?\b", lower)
+        if m_rel:
+            direction = m_rel.group(1)
+            amt = int(m_rel.group(2))
+            sign = "+" if any(d in direction for d in ("increase", "raise", "boost", "turn up")) else "-"
+            return f"adjust_volume:{sign}{amt}"
+
+        # 3. Mute / Unmute
+        if "unmute" in lower:
+            return "unmute"
         if "mute" in lower:
             return "mute"
-        if "volume up" in lower or "vol up" in lower or "louder" in lower:
+
+        # 4. Discrete volume steps
+        if any(w in lower for w in ("volume up", "vol up", "louder", "turn it up", "increase volume")):
             return "vol_up"
-        if "volume down" in lower or "vol down" in lower or "quieter" in lower:
+        if any(w in lower for w in ("volume down", "vol down", "quieter", "turn it down", "decrease volume", "lower the volume")):
             return "vol_down"
-        if "pause" in lower:
+
+        # 5. Playback controls
+        if "pause" in lower or "stop" in lower:
             return "pause"
-        if "play" in lower:
+        if "play" in lower or "resume" in lower:
             return "play"
-        if "next" in lower:
+        if "next" in lower or "skip" in lower:
             return "next"
-        if "prev" in lower:
+        if "prev" in lower or "previous" in lower or "back" in lower:
             return "prev"
+
         return "vol_up"
 
     @classmethod
@@ -775,4 +942,10 @@ class RuntimeCoordinator:
         cleaned = re.sub(r"\s+(?:into\s+.*|in\s+.*|here)$", "", cleaned, flags=re.IGNORECASE)
         cleaned = cleaned.strip("\"' ")
         return cls._format_code_if_applicable(cleaned) or query
+
+    # Convenient aliases
+    execute = process_command
+    execute_query = process_command
+
+
 

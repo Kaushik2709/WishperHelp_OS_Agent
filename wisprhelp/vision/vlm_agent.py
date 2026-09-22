@@ -245,11 +245,17 @@ class VLMAgent:
         api_key = config.gemini_api_key
 
         prompt = (
-            f"You are WisprHelp's System Two Vision Grounding Agent.\n"
+            f"You are WisprHelp's System Two Vision Grounding Agent acting as an autonomous human user.\n"
             f"Goal: {goal}\n"
             f"Screen Resolution: {frame.width}x{frame.height}\n"
             f"Action History: {json.dumps(history[-3:]) if history else 'None'}\n\n"
-            f"Determine the single next physical action to advance the goal. Output JSON matching one schema:\n"
+            f"Instructions:\n"
+            f"1. Examine the screenshot carefully to locate the target control, button, chat, icon, or list item.\n"
+            f"2. Human-like Semantic & Phonetic Tolerance: Spoken user speech may contain slight phonetic variations or typos (e.g. 'show mode' -> 'Show more' button or 'AI Mode' tab, 'cross' -> 'X / Close', 'magnifier' -> 'Search icon'). As an intelligent human user, locate the most visually and semantically plausible button or control on screen that fulfills the user's intended action.\n"
+            f"3. For ordinal or positional goals (e.g. 'first chat', 'second-last chat', 'third item'): find the list on screen, count the items in order (first at top, last at bottom), and target the center of that specific item.\n"
+            f"4. For visual attributes (e.g. 'blue button', 'green checkmark', 'plus icon'): find the matching colored element.\n"
+            f"5. Target the EXACT center coordinates of the button or control.\n"
+            f"6. Output strictly valid JSON matching one schema:\n"
             f"- Click: {{\"type\": \"click\", \"params\": {{\"x\": <int>, \"y\": <int>}}, \"thought\": \"<reason>\"}}\n"
             f"- Double Click: {{\"type\": \"double_click\", \"params\": {{\"x\": <int>, \"y\": <int>}}, \"thought\": \"<reason>\"}}\n"
             f"- Type Text: {{\"type\": \"type_text\", \"params\": {{\"text\": \"<string>\"}}, \"thought\": \"<reason>\"}}\n"
@@ -257,7 +263,7 @@ class VLMAgent:
             f"- Finish: {{\"type\": \"finish\", \"params\": {{\"message\": \"<summary>\"}}, \"thought\": \"<reason>\"}}"
         )
 
-        b64_image = frame.to_base64_jpeg(quality=80)
+        b64_image = frame.to_base64_jpeg(quality=75)
         payload = {
             "contents": [{
                 "parts": [
@@ -276,11 +282,14 @@ class VLMAgent:
             },
         }
 
-        # Candidate models with resilient quota fallback (Lite models have higher free tier limits)
+        # Candidate models with resilient quota fallback (gemini-3.1-flash-lite and gemini-3-flash-preview active & responsive)
         candidate_models = [
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-flash-latest",
             "gemini-2.5-flash-lite",
-            "gemini-3.5-flash-lite",
-            "gemini-2.5-flash",
         ]
 
         last_error_msg = "No response from Gemini API"
