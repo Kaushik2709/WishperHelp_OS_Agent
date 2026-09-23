@@ -514,7 +514,25 @@ class WindowsOSAdapter(BaseOSAdapter):
 
         try:
             root = None
-            if HAS_WIN32:
+            if target_app:
+                # Find target app window specifically among root children
+                t_lower = target_app.lower()
+                try:
+                    for win_ctrl in auto.GetRootControl().GetChildren():
+                        name_lower = (win_ctrl.Name or "").lower()
+                        class_lower = (win_ctrl.ClassName or "").lower()
+                        if t_lower in name_lower or t_lower in class_lower:
+                            root = win_ctrl
+                            try:
+                                win_ctrl.SetActive()
+                                win_ctrl.SetFocus()
+                            except Exception:
+                                pass
+                            break
+                except Exception:
+                    pass
+
+            if not root and HAS_WIN32:
                 try:
                     hwnd = win32gui.GetForegroundWindow()
                     if hwnd:
@@ -534,14 +552,14 @@ class WindowsOSAdapter(BaseOSAdapter):
                 rect = ctrl.BoundingRectangle
                 w, h = rect.width(), rect.height()
 
-                # Basic sanity check: visible on screen
-                if w <= 10 or h <= 10 or rect.top < 0 or rect.left < 0:
+                # Basic sanity check: visible on screen (allow negative coordinates up to -30 for maximized windows on Windows 10/11)
+                if w <= 10 or h <= 10 or rect.top < -30 or rect.left < -30:
                     return False
 
                 # Chat / List item matching
                 if item_type_lower in ("chat", "conversation", "contact", "item", "row", "message"):
-                    if any(t in ctrl_type for t in ("listitem", "custom", "dataitem", "pane")):
-                        if w >= 80 and 20 <= h <= 200:
+                    if any(t in ctrl_type for t in ("listitem", "custom", "dataitem", "pane", "button", "group")):
+                        if w >= 60 and 20 <= h <= 250:
                             candidates.append(ctrl)
                 elif item_type_lower in ("tab", "tabitem"):
                     if "tabitem" in ctrl_type or ("button" in ctrl_type and h <= 50):
@@ -556,6 +574,20 @@ class WindowsOSAdapter(BaseOSAdapter):
                 return False
 
             auto.WalkControl(root, _collect_items, maxDepth=12)
+
+            # If candidates are empty and target is WhatsApp chat list:
+            # WhatsApp Desktop chat list is in the left 20-30% pane, below the header/search bar
+            if not candidates and (
+                (target_app and "whatsapp" in target_app.lower())
+                or (root and "whatsapp" in (root.Name or "").lower())
+            ) and item_type_lower in ("chat", "conversation", "contact", "item", "row"):
+                win_r = root.BoundingRectangle
+                if win_r.width() > 200 and win_r.height() > 200:
+                    chat_x = win_r.left + min(220, max(80, int(win_r.width() * 0.22)))
+                    row_offset = 140 + max(0, ordinal_index) * 72
+                    chat_y = win_r.top + row_offset
+                    logger.info("Using WhatsApp desktop layout coordinate fallback for ordinal [%d] chat: (%d, %d)", ordinal_index, chat_x, chat_y)
+                    return (chat_x, chat_y)
 
             if not candidates:
                 logger.info("No candidates found for ordinal element type '%s'", item_type)
@@ -759,3 +791,145 @@ class WindowsOSAdapter(BaseOSAdapter):
             pyautogui.press(key)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted key press: %s", key)
+
+    def scroll(self, direction: str = "down", amount: int = 3) -> None:
+        """Scrolls up or down using native PyAutoGUI or Win32 mouse wheel event."""
+        try:
+            clicks = -amount if direction == "down" else amount
+            pyautogui.scroll(clicks * 120)
+        except pyautogui.FailSafeException:
+            logger.warning("PyAutoGUI fail-safe intercepted scroll.")
+        except Exception:
+            self.press_key("pagedown" if direction == "down" else "pageup")
+
+    def get_open_windows(self) -> List[WindowInfo]:
+        """Enumerates visible, top-level desktop windows via Win32."""
+        if not HAS_WIN32:
+            active = self.get_active_window()
+            return [active] if active else []
+
+        windows: List[WindowInfo] = []
+
+        def _enum_win_callback(hwnd: int, extra: Any) -> bool:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd).strip()
+            if not title:
+                return True
+            rect = win32gui.GetWindowRect(hwnd)
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            if w <= 10 or h <= 10:
+                return True
+
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                proc_name = ""
+                try:
+                    import psutil
+                    proc_name = psutil.Process(pid).name()
+                except Exception:
+                    pass
+
+                windows.append(
+                    WindowInfo(
+                        title=title,
+                        process_name=proc_name,
+                        pid=pid,
+                        rect=(rect[0], rect[1], w, h),
+                        is_minimized=win32gui.IsIconic(hwnd) != 0,
+                    )
+                )
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(_enum_win_callback, None)
+        except Exception as exc:
+            logger.debug("Win32 EnumWindows failed: %s", exc)
+
+        return windows
+
+    def focus_window(self, title_or_keyword: str) -> bool:
+        """Finds window matching title_or_keyword and brings it to foreground."""
+        if not HAS_WIN32:
+            return self.launch_app(title_or_keyword)
+
+        keyword_lower = title_or_keyword.lower().strip()
+        matched_hwnd = None
+
+        def _find_hwnd(hwnd: int, extra: Any) -> bool:
+            nonlocal matched_hwnd
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd).strip().lower()
+            if keyword_lower in title:
+                matched_hwnd = hwnd
+                return False
+            return True
+
+        try:
+            win32gui.EnumWindows(_find_hwnd, None)
+            if matched_hwnd:
+                if win32gui.IsIconic(matched_hwnd):
+                    win32gui.ShowWindow(matched_hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(matched_hwnd)
+                time.sleep(0.1)
+                logger.info("Focused window hwnd %s for keyword '%s'", matched_hwnd, title_or_keyword)
+                return True
+        except Exception as exc:
+            logger.debug("focus_window error: %s", exc)
+
+        return self.launch_app(title_or_keyword)
+
+    def get_clipboard_text(self) -> str:
+        """Returns the current string contents of the OS clipboard."""
+        try:
+            return pyperclip.paste() or ""
+        except Exception:
+            return ""
+
+    def get_visible_elements(self, max_depth: int = 4) -> List[Dict[str, Any]]:
+        """Extracts visible interactive controls in the foreground window via UI Automation."""
+        if not HAS_UIA:
+            return []
+
+        elements: List[Dict[str, Any]] = []
+        try:
+            root = None
+            if HAS_WIN32:
+                try:
+                    hwnd = win32gui.GetForegroundWindow()
+                    if hwnd:
+                        root = auto.ControlFromHandle(hwnd)
+                except Exception:
+                    pass
+            if not root:
+                root = auto.GetForegroundControl()
+            if not root:
+                return []
+
+            def _collect_elem(ctrl: auto.Control, depth: int) -> bool:
+                name = (ctrl.Name or "").strip()
+                ctrl_type = (ctrl.ControlTypeName or "").lower()
+                rect = ctrl.BoundingRectangle
+                if rect.width() > 10 and rect.height() > 10 and rect.top >= 0 and rect.left >= 0:
+                    cx = rect.left + rect.width() // 2
+                    cy = rect.top + rect.height() // 2
+                    if any(t in ctrl_type for t in ("button", "tabitem", "listitem", "edit", "menuitem", "checkbox", "hyperlink")):
+                        if name:
+                            elements.append({
+                                "name": name,
+                                "control_type": ctrl_type,
+                                "auto_id": ctrl.AutomationId or "",
+                                "center": (cx, cy),
+                            })
+                return False
+
+            auto.WalkControl(root, _collect_elem, maxDepth=max_depth)
+        except Exception as exc:
+            logger.debug("get_visible_elements error: %s", exc)
+
+        return elements
+

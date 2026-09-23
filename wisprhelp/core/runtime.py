@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from wisprhelp.agent.planner import SemanticAgent, AgentTurnResult
 from wisprhelp.classification.classifier import JevClassifier
 from wisprhelp.classification.schemas import JevDecision, TargetApp
 from wisprhelp.core.groq_planner import GroqStrategicPlanner
@@ -49,6 +50,7 @@ class RuntimeCoordinator:
         planner: Optional[GroqStrategicPlanner] = None,
         hud: Optional[StatusOverlayHUD] = None,
         feedback: Optional[AudioFeedback] = None,
+        agent: Optional[SemanticAgent] = None,
     ) -> None:
         self.classifier = classifier or JevClassifier()
         self.router = router or CommandRouter()
@@ -58,6 +60,19 @@ class RuntimeCoordinator:
         self.planner = planner or GroqStrategicPlanner()
         self.hud = hud
         self.feedback = feedback
+        self.agent = agent or SemanticAgent(
+            os_adapter=self.os_adapter,
+            classifier=self.classifier,
+            safety_gate=self.safety_gate,
+        )
+
+    def process_turn_semantic(
+        self,
+        user_query: str,
+        confirmation_response: Optional[str] = None,
+    ) -> AgentTurnResult:
+        """Processes user goal using the dynamic SemanticAgent cognitive brain."""
+        return self.agent.process_turn(user_query, confirmation_response)
 
     def process_command(
         self,
@@ -79,6 +94,62 @@ class RuntimeCoordinator:
         if self.hud:
             self.hud.set_state(HUDState.THINKING, f"Analyzing: {user_query}")
 
+        # 0a. Emergency Interruption ("Wait, stop", "cancel")
+        if self.agent.reasoner._is_interruption(user_query.lower()):
+            elapsed = (time.perf_counter() - start_time) * 1000
+            if self.hud:
+                self.hud.set_state(HUDState.IDLE, "Halted")
+            if self.feedback:
+                self.feedback.play_abort()
+            msg = "Action halted immediately."
+            self.agent.memory.add_turn(user_query, msg)
+            return ExecutionResult(
+                success=True,
+                route=RouteTarget.CONVERSATIONAL_QUERY,
+                message=msg,
+                latency_ms=elapsed,
+            )
+
+        # 0b. First-class literal text dictation distinction (e.g. Type: "open Chrome and search for Jev")
+        literal_text = self.agent.reasoner._extract_literal_text_dictation(user_query)
+        if literal_text is not None:
+            if self.hud:
+                self.hud.set_state(HUDState.EXECUTING, f"Typing: {literal_text[:20]}")
+            ok = self.os_adapter.inject_unicode_text(literal_text)
+            elapsed = (time.perf_counter() - start_time) * 1000
+            msg = f"Injected text into active focus: '{literal_text}'."
+            if self.hud:
+                self.hud.set_state(HUDState.IDLE, "Ready")
+            if self.feedback:
+                self.feedback.play_success()
+            self.agent.memory.add_turn(user_query, msg)
+            return ExecutionResult(
+                success=ok,
+                route=RouteTarget.TEXT_INJECTION,
+                message=msg,
+                decision=decision,
+                latency_ms=elapsed,
+            )
+
+        # 0c. User Correction Handling (e.g. "Actually, use Firefox instead", "No, the other one")
+        if self.agent.reasoner._is_correction(user_query.lower()):
+            sem_turn = self.agent.process_turn(user_query, confirmation_response)
+            elapsed = (time.perf_counter() - start_time) * 1000
+            if self.hud:
+                self.hud.set_state(HUDState.IDLE if sem_turn.success else HUDState.ERROR, "Ready")
+            if self.feedback:
+                if sem_turn.success:
+                    self.feedback.play_success()
+                else:
+                    self.feedback.play_abort()
+            return ExecutionResult(
+                success=sem_turn.success,
+                route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                message=sem_turn.message,
+                decision=decision,
+                latency_ms=elapsed,
+            )
+
         # Handle pending safety confirmation resolution
         if confirmation_response:
             confirmed_action = self.safety_gate.resolve_confirmation(confirmation_response)
@@ -96,6 +167,7 @@ class RuntimeCoordinator:
                 )
             # User confirmed! Execute the held action
             return self._execute_confirmed_action(confirmed_action, start_time)
+
 
         # 1. Sense Active OS Context
         active_win = self.os_adapter.get_active_window()
@@ -118,6 +190,19 @@ class RuntimeCoordinator:
         if (route in (RouteTarget.CLARIFY, RouteTarget.PRIORITY_1_LAUNCH)) and (in_app_cmd or has_compound_plan):
             logger.info("Promoting route '%s' to GUI_WORKFLOW_AUTOMATION for compound query: '%s'", route.value, user_query)
             route = RouteTarget.GUI_WORKFLOW_AUTOMATION
+
+        # Conversational query resolution: If router flagged CLARIFY but query is conversational, promote to CONVERSATIONAL_QUERY
+        conversational_triggers = (
+            "who are you", "what is your name", "what can you do", "what are your capabilities",
+            "tell me a joke", "tell me about yourself", "how are you",
+            "what is wisprhelp", "what can i ask", "koun ho", "kya kar sakte ho",
+            "namaste", "good morning", "good afternoon", "good evening", "how's it going",
+        )
+        single_words = {"hi", "hello", "hey", "help", "who"}
+        q_words = set(re.findall(r"\b\w+\b", user_query.lower()))
+        if route == RouteTarget.CLARIFY and (any(w in user_query.lower() for w in conversational_triggers) or (bool(q_words & single_words) and len(q_words) <= 2)):
+            logger.info("Promoting route CLARIFY to CONVERSATIONAL_QUERY for query: '%s'", user_query)
+            route = RouteTarget.CONVERSATIONAL_QUERY
 
         # 4. Dispatch by Selected Route
         if route == RouteTarget.CLARIFY:
@@ -216,7 +301,25 @@ class RuntimeCoordinator:
             route = RouteTarget.GUI_WORKFLOW_AUTOMATION
 
         if route == RouteTarget.TEXT_INJECTION:
-            text_to_type = self._extract_text_content(user_query)
+            # Check for generative composition request vs literal text typing
+            lower_q = user_query.lower()
+            composition_prompts = (
+                "something about", "something on", "an email", "a message", "a poem", "a story",
+                "a note", "a letter", "a paragraph", "an essay", "a function", "code to",
+                "a summary", "a review", "a response", "a reply", "about",
+            )
+            is_dictated_code = bool(re.search(r"\bcode\s+(?:called|named)\b", lower_q))
+            is_generative = not is_dictated_code and any(lower_q.startswith(w) for w in ("write", "compose", "draft", "generate", "likho", "लिखो")) and (
+                any(p in lower_q for p in composition_prompts) or len(user_query.split()) > 3
+            ) and not (user_query.strip().startswith(('type "', "type '", 'write "', "write '", 'Type: "', 'Write: "')))
+
+            if is_generative:
+                if self.hud:
+                    self.hud.set_state(HUDState.THINKING, "Composing text...")
+                text_to_type = self.planner.compose_text(user_query)
+            else:
+                text_to_type = self._extract_text_content(user_query)
+
             if self.hud:
                 self.hud.set_state(HUDState.EXECUTING, f"Typing: {text_to_type[:20]}")
             ok = self.os_adapter.inject_unicode_text(text_to_type)
@@ -321,13 +424,16 @@ class RuntimeCoordinator:
             if self.hud:
                 self.hud.set_state(HUDState.EXECUTING, f"Focusing {target_app}")
             self.os_adapter.launch_app(target_app)
-            self.os_adapter.wait_for_active_window([target_app], timeout=1.5)
-            time.sleep(0.3)
+            self.os_adapter.wait_for_active_window([target_app], timeout=2.0)
+            time.sleep(0.5)
 
         # Step 2: If there is an in-app command, execute it like a real human user
         if in_app_cmd:
             human_res = self._execute_human_like_action(target_app, in_app_cmd, user_query, decision)
             if human_res.success:
+                return human_res
+            # If human action already attempted Priority 3 Vision, return it directly to avoid duplicate visual loops
+            if human_res.message and "Priority 3 Vision" in human_res.message:
                 return human_res
 
         # Step 3: Try Priority 2 Native Accessibility Tree (UIA)
@@ -379,8 +485,14 @@ class RuntimeCoordinator:
         cmd_lower = cmd_clean.lower()
         app_lower = (app_name or "").lower()
 
-        # 0. Button / Control / List / Chat Click Action
-        is_click = bool(
+        # 0. Check for browser tab & page control shortcuts before generic click handling
+        is_tab_shortcut = any(
+            cmd_lower == w or cmd_lower.startswith(w)
+            for w in ("new tab", "open a new tab", "open new tab", "create a new tab", "close tab", "close this tab", "shut tab", "reopen tab", "restore tab", "refresh", "reload", "refresh page", "scroll down", "scroll up", "go back", "go forward")
+        )
+
+        # Button / Control / List / Chat Click Action
+        is_click = (not is_tab_shortcut) and bool(
             re.search(r"\b(?:click(?:\s+on)?|press|tap|hit|select|push|daba|dabao|क्लिक)\b", cmd_lower)
             or re.search(r"\b(?:button|btn|tab|icon|checkbox|link|chat|item|row)\b", cmd_lower)
         )
@@ -455,9 +567,152 @@ class RuntimeCoordinator:
                 decision=decision,
             )
 
-        # 1. Browser Navigation & Web Search (Chrome, Edge, Brave, Firefox, Browser)
+        # 1. Browser Navigation, Search & Tab Controls (Chrome, Edge, Brave, Firefox, Browser)
         is_browser = any(b in app_lower for b in ["browser", "chrome", "edge", "brave", "firefox", "opera"])
-        is_search = any(cmd_lower.startswith(w) for w in ["search for", "search", "look up", "find", "google", "go to", "visit", "open url", "navigate to"])
+
+        # Tab management & page controls
+        if is_browser or any(w in cmd_lower for w in ("tab", "refresh", "reload", "scroll", "back", "forward")):
+            if cmd_lower in ("new tab", "open a new tab", "open new tab", "create a new tab"):
+                self.os_adapter.key_combination(["ctrl", "t"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Opened new browser tab.",
+                    decision=decision,
+                )
+            if cmd_lower in ("close tab", "close this tab", "shut tab", "close current tab"):
+                self.os_adapter.key_combination(["ctrl", "w"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Closed current browser tab.",
+                    decision=decision,
+                )
+            if cmd_lower in ("reopen tab", "restore tab", "open closed tab", "reopen closed tab"):
+                self.os_adapter.key_combination(["ctrl", "shift", "t"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Reopened last closed tab.",
+                    decision=decision,
+                )
+            if cmd_lower in ("refresh", "reload", "refresh page", "reload page"):
+                self.os_adapter.key_combination(["ctrl", "r"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Refreshed page.",
+                    decision=decision,
+                )
+            if cmd_lower in ("scroll down", "page down"):
+                if hasattr(self.os_adapter, "scroll"):
+                    self.os_adapter.scroll("down", 4)
+                else:
+                    self.os_adapter.press_key("pagedown")
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Scrolled down.",
+                    decision=decision,
+                )
+            if cmd_lower in ("scroll up", "page up"):
+                if hasattr(self.os_adapter, "scroll"):
+                    self.os_adapter.scroll("up", 4)
+                else:
+                    self.os_adapter.press_key("pageup")
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Scrolled up.",
+                    decision=decision,
+                )
+            if cmd_lower in ("go back", "back", "previous page"):
+                self.os_adapter.key_combination(["alt", "left"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Navigated back.",
+                    decision=decision,
+                )
+            if cmd_lower in ("go forward", "forward", "next page"):
+                self.os_adapter.key_combination(["alt", "right"])
+                return ExecutionResult(
+                    success=True,
+                    route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                    message="Navigated forward.",
+                    decision=decision,
+                )
+
+        # Website navigation & Web search
+        is_search = any(cmd_lower.startswith(w) for w in ["search for", "search", "look up", "find", "google", "go to", "visit", "open url", "navigate to", "open site"])
+        is_url = bool(re.search(r"\b[a-zA-Z0-9_\-]+\.(?:com|org|io|net|edu|ai|gov|co|app|dev)\b", cmd_clean, re.IGNORECASE))
+
+        # Check popular websites: youtube, github, reddit, twitter, google, amazon, wikipedia, etc.
+        popular_sites = {
+            "youtube": "youtube.com",
+            "github": "github.com",
+            "reddit": "reddit.com",
+            "twitter": "x.com",
+            "x": "x.com",
+            "google": "google.com",
+            "amazon": "amazon.com",
+            "wikipedia": "wikipedia.org",
+            "netflix": "netflix.com",
+            "linkedin": "linkedin.com",
+            "facebook": "facebook.com",
+            "instagram": "instagram.com",
+            "gmail": "mail.google.com",
+        }
+
+        target_site_url = None
+        for site_key, site_url in popular_sites.items():
+            if re.search(rf"\b(?:go to|visit|open)\s+(?:the\s+)?{re.escape(site_key)}\b", cmd_lower) or cmd_lower in (site_key, f"go to {site_key}", f"open {site_key}"):
+                target_site_url = site_url
+                break
+
+        if target_site_url:
+            logger.info("Human-like browser action: Navigating to '%s'", target_site_url)
+            self.os_adapter.key_combination(["ctrl", "l"])
+            time.sleep(0.08)
+            self.os_adapter.inject_unicode_text(target_site_url)
+            time.sleep(0.05)
+            self.os_adapter.press_key("enter")
+            return ExecutionResult(
+                success=True,
+                route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                message=f"Human action: Navigated to '{target_site_url}' in {app_name or 'browser'}.",
+                decision=decision,
+            )
+
+        # Check if the user is asking to GENERATE/COMPOSE content vs literal typing (Check this FIRST!)
+        is_generative_composition = False
+        composition_prompts = (
+            "something about", "something on", "an email", "a message", "a poem", "a story",
+            "a note", "a letter", "a paragraph", "an essay", "a function", "code to",
+            "a summary", "a review", "a response", "a reply", "about",
+        )
+        is_dictated_code = bool(re.search(r"\bcode\s+(?:called|named)\b", cmd_lower))
+        if not is_dictated_code and any(cmd_lower.startswith(w) for w in ("write", "compose", "draft", "generate", "likho", "लिखो")):
+            # If not explicitly quoted (like: type "hello")
+            if not (cmd_clean.startswith(('type "', "type '", 'write "', "write '", 'Type: "', 'Write: "'))):
+                if any(p in cmd_lower for p in composition_prompts) or len(cmd_clean.split()) > 3:
+                    is_generative_composition = True
+
+        if is_generative_composition:
+            logger.info("Human-like generative writing detected for: '%s'", cmd_clean)
+            if self.hud:
+                self.hud.set_state(HUDState.THINKING, "Composing text...")
+            composed_text = self.planner.compose_text(cmd_clean)
+            if self.hud:
+                self.hud.set_state(HUDState.EXECUTING, "Typing composed text...")
+            time.sleep(0.2)
+            ok = self.os_adapter.inject_unicode_text(composed_text)
+            return ExecutionResult(
+                success=ok,
+                route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                message=f"Human action: Composed and typed text for '{cmd_clean}'.",
+                decision=decision,
+            )
 
         # Prioritize explicit payload from decomposed plan if available
         search_query = None
@@ -467,15 +722,34 @@ class RuntimeCoordinator:
                     search_query = s.payload
                     break
 
-        if is_browser or is_search or search_query:
+        if is_search or is_url or search_query:
             if not search_query:
+                # Strip search prefix and engine mentions: e.g. "search google for weather in Tokyo" -> "weather in Tokyo"
                 search_query = re.sub(
-                    r"^(search\s+for|search|look\s+up|find|google|go\s+to|visit|open\s+url|navigate\s+to)\s+",
+                    r"^(?:search\s+for|search(?:\s+google|\s+youtube|\s+bing)?\s+for|search|look\s+up|find|google|go\s+to|visit|open\s+url|navigate\s+to)\s+",
                     "",
                     cmd_clean,
                     flags=re.IGNORECASE,
                 ).strip()
+                search_query = re.sub(r"\s+(?:on|in)\s+(?:google|youtube|bing|yahoo|browser|chrome)$", "", search_query, flags=re.IGNORECASE).strip()
+
             if search_query:
+                # If search_query is a domain without protocol, e.g. "github.com" or "reddit.com"
+                if re.match(r"^[a-zA-Z0-9_\-]+\.(?:com|org|io|net|edu|ai|gov|dev)$", search_query, re.IGNORECASE):
+                    url = search_query
+                    logger.info("Human-like browser navigation: Opening URL '%s'", url)
+                    self.os_adapter.key_combination(["ctrl", "l"])
+                    time.sleep(0.08)
+                    self.os_adapter.inject_unicode_text(url)
+                    time.sleep(0.05)
+                    self.os_adapter.press_key("enter")
+                    return ExecutionResult(
+                        success=True,
+                        route=RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                        message=f"Human action: Navigated to '{url}' in {app_name or 'browser'}.",
+                        decision=decision,
+                    )
+
                 logger.info("Human-like browser action: Focusing address bar and searching for '%s'", search_query)
                 self.os_adapter.key_combination(["ctrl", "l"])
                 time.sleep(0.08)
@@ -530,8 +804,8 @@ class RuntimeCoordinator:
                 decision=decision,
             )
 
-        # 3. Text Typing & Note Taking (Notepad, Word, Editor, Chat)
-        is_typing = any(cmd_lower.startswith(w) for w in ["type", "write", "dictate", "enter", "paste", "लिखो", "टाइप करो"])
+        # 3. Text Typing & Note Taking (Notepad, Word, Editor, Chat, Web)
+        is_typing = any(cmd_lower.startswith(w) for w in ["type", "write", "dictate", "enter", "paste", "compose", "draft", "likho", "लिखो", "टाइप करो"])
 
         # Prioritize explicit text payload from decomposed plan if available
         text_from_plan = None
@@ -828,7 +1102,43 @@ class RuntimeCoordinator:
             "powerpoint": "powerpoint",
             "steam": "steam",
             "discord": "discord",
+            "youtube": "chrome",
+            "github": "chrome",
+            "google": "chrome",
+            "reddit": "chrome",
+            "twitter": "chrome",
+            "x": "chrome",
+            "linkedin": "chrome",
+            "amazon": "chrome",
+            "wikipedia": "chrome",
+            "netflix": "chrome",
+            "gmail": "chrome",
+            "browser": "chrome",
+            "my browser": "chrome",
         }
+
+        q_lower = query_clean.lower()
+
+        # Browser tab & page shortcuts
+        tab_actions = {
+            "new tab": "new tab",
+            "open a new tab": "new tab",
+            "open new tab": "new tab",
+            "close tab": "close tab",
+            "close this tab": "close tab",
+            "reopen tab": "reopen tab",
+            "restore tab": "reopen tab",
+            "refresh": "refresh",
+            "reload": "refresh",
+            "refresh page": "refresh",
+            "reload page": "refresh",
+            "scroll down": "scroll down",
+            "scroll up": "scroll up",
+            "go back": "go back",
+            "go forward": "go forward",
+        }
+        if q_lower in tab_actions:
+            return "chrome", tab_actions[q_lower]
 
         # Pattern 0: Preposition first: 'In/On/Inside <app>[,] <cmd>': e.g. 'In VS Code, create a file called main.py'
         m0 = re.match(
@@ -838,10 +1148,11 @@ class RuntimeCoordinator:
         )
         if m0:
             raw_app = m0.group("app").strip().lower()
-            cmd = m0.group("cmd").strip()
-            cmd = re.sub(r"\b([a-zA-Z0-9_\-]+)\.(by|pie)\b", r"\1.py", cmd, flags=re.IGNORECASE)
-            app = alias_map.get(raw_app, raw_app)
-            return app, cmd
+            if raw_app in alias_map:
+                cmd = m0.group("cmd").strip()
+                cmd = re.sub(r"\b([a-zA-Z0-9_\-]+)\.(by|pie)\b", r"\1.py", cmd, flags=re.IGNORECASE)
+                app = alias_map[raw_app]
+                return app, cmd
 
         # Pattern 1: Action first, then 'in/on/using/with' app: e.g. 'search weather in chrome', 'click enter on antigravity'
         m1 = re.match(
@@ -851,10 +1162,11 @@ class RuntimeCoordinator:
         )
         if m1:
             raw_app = m1.group("app").strip().lower()
-            cmd = m1.group("cmd").strip()
-            cmd = re.sub(r"\b([a-zA-Z0-9_\-]+)\.(by|pie)\b", r"\1.py", cmd, flags=re.IGNORECASE)
-            app = alias_map.get(raw_app, raw_app)
-            return app, cmd
+            if raw_app in alias_map:
+                cmd = m1.group("cmd").strip()
+                cmd = re.sub(r"\b([a-zA-Z0-9_\-]+)\.(by|pie)\b", r"\1.py", cmd, flags=re.IGNORECASE)
+                app = alias_map[raw_app]
+                return app, cmd
 
         # Pattern 2: 'open/launch/start X and/then/to Y': e.g. 'open chrome and search for weather'
         m2 = re.match(
@@ -868,6 +1180,40 @@ class RuntimeCoordinator:
             cmd = re.sub(r"\b([a-zA-Z0-9_\-]+)\.(by|pie)\b", r"\1.py", cmd, flags=re.IGNORECASE)
             app = alias_map.get(raw_app, raw_app)
             return app, cmd
+
+        # Web Search: e.g. "search google for weather in Tokyo", "search for quantum computing", "google python tutorials"
+        m_web_search = re.match(
+            r"^(?:search(?:\s+google|\s+bing|\s+youtube)?\s+(?:for\s+)?|google\s+|look\s+up\s+)(?P<query>.+?)(?:\s+(?:on|in)\s+(?:google|youtube|bing|yahoo|the\s+web|chrome|browser))?$",
+            query_clean,
+            re.IGNORECASE,
+        )
+        if m_web_search and not any(w in q_lower for w in ("file", "folder", "code", "directory")):
+            search_term = m_web_search.group("query").strip()
+            if "youtube" in q_lower:
+                return "chrome", f"go to youtube.com and search for {search_term}"
+            return "chrome", f"search for {search_term}"
+
+        # Website Navigation: e.g. "go to github", "visit reddit", "open youtube", "open amazon.com"
+        m_site = re.match(r"^(?:go\s+to|visit|open(?:\s+the)?)\s+(?P<site>[a-zA-Z0-9_\-\.]+)(?:\s+(?:site|website|page))?$", query_clean, re.IGNORECASE)
+        if m_site:
+            raw_site = m_site.group("site").strip().lower()
+            known_sites = {
+                "youtube": "youtube.com",
+                "github": "github.com",
+                "reddit": "reddit.com",
+                "twitter": "x.com",
+                "x": "x.com",
+                "google": "google.com",
+                "amazon": "amazon.com",
+                "wikipedia": "wikipedia.org",
+                "netflix": "netflix.com",
+                "linkedin": "linkedin.com",
+                "gmail": "mail.google.com",
+            }
+            if raw_site in known_sites:
+                return "chrome", f"go to {known_sites[raw_site]}"
+            if re.search(r"\.(com|org|net|io|ai|gov|edu|dev)$", raw_site):
+                return "chrome", f"go to {raw_site}"
 
         # Special handling for standalone 'code' or 'open code'
         q_lower = query_clean.lower()

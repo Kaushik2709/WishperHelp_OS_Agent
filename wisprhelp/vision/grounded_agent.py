@@ -310,16 +310,20 @@ CRITICAL RULES:
         }
 
         # Try configured model first, then resilient fallbacks
+        configured = config.gemini_model if config.gemini_model and not config.gemini_model.startswith("gemini-3") else "gemini-2.5-flash"
         models_to_try = [
-            config.gemini_model,
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
+            configured,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
         ]
+        seen = set()
+        deduped_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
-        for m in models_to_try:
+        for m in deduped_models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
             try:
-                resp = requests.post(url, json=payload, timeout=4.0)
+                resp = requests.post(url, json=payload, timeout=12.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()

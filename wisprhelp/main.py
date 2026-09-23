@@ -21,6 +21,14 @@ project_root = str(Path(__file__).resolve().parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Force UTF-8 standard streams on Windows to prevent charmap/CP1252 print crashes
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from wisprhelp.classification.classifier import JevClassifier
 from wisprhelp.config import config
 from wisprhelp.core.router import CommandRouter
@@ -233,7 +241,21 @@ def main() -> None:
                 if res.route.value == "conversational_query":
                     tts.speak_async(res.message)
                 elif res.route.value == "safety_interlock":
-                    tts.speak_async("High risk action detected. Please confirm.")
+                    tts.speak_async("High risk action detected. Please confirm with yes or no.")
+                elif res.success:
+                    if "Composed and typed text" in res.message:
+                        tts.speak_async("I've written that into your active document.")
+                    elif "Searched for" in res.message:
+                        tts.speak_async("Searching the web for you.")
+                    elif "Navigated to" in res.message:
+                        tts.speak_async("Opening website.")
+                    elif "Opened new browser tab" in res.message:
+                        tts.speak_async("New tab opened.")
+                    elif "Closed current browser tab" in res.message:
+                        tts.speak_async("Tab closed.")
+                    elif "Launched application" in res.message:
+                        app_name = res.message.split("'")[1] if "'" in res.message else "app"
+                        tts.speak_async(f"Opening {app_name}.")
                 elif not res.success:
                     tts.speak_async("Could not complete action.")
             except Exception as exc:

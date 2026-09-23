@@ -124,6 +124,54 @@ class BaseOSAdapter(ABC):
         """Presses and releases a single key (e.g. 'enter', 'tab', 'esc')."""
         pass
 
+    def scroll(self, direction: str = "down", amount: int = 3) -> None:
+        """Scrolls the current window or focused viewport up or down."""
+        try:
+            import pyautogui
+            clicks = -amount if direction == "down" else amount
+            pyautogui.scroll(clicks * 100)
+        except Exception:
+            self.press_key("pagedown" if direction == "down" else "pageup")
+
+    def get_open_windows(self) -> List[WindowInfo]:
+        """Returns a list of visible open desktop windows."""
+        active = self.get_active_window()
+        return [active] if active else []
+
+    def focus_window(self, title_or_keyword: str) -> bool:
+        """Switches focus to the window matching the given title or keyword."""
+        return self.launch_app(title_or_keyword)
+
+    def get_clipboard_text(self) -> str:
+        """Returns the current string contents of the OS clipboard."""
+        try:
+            import pyperclip
+            return pyperclip.paste() or ""
+        except Exception:
+            return ""
+
+    def open_file(self, file_path: str) -> bool:
+        """Opens a local file using the default OS application."""
+        import os
+        import platform
+        import subprocess
+        expanded = os.path.expanduser(file_path)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(expanded)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", expanded])
+            else:
+                subprocess.Popen(["xdg-open", expanded])
+            return True
+        except Exception:
+            return False
+
+    def get_visible_elements(self, max_depth: int = 4) -> List[Dict[str, Any]]:
+        """Returns interactive UI controls (buttons, tabs, inputs) visible in the foreground."""
+        return []
+
+
     def wait_for_active_window(self, target_keywords: List[str], timeout: float = 2.0) -> bool:
         """Polls until the foreground window title or process contains one of target_keywords."""
         import time
@@ -138,3 +186,4 @@ class BaseOSAdapter(ABC):
                     return True
             time.sleep(0.1)
         return False
+

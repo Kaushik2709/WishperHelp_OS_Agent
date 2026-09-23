@@ -56,8 +56,8 @@ class CommandRouter:
             logger.warning("Routing decision to SAFETY_INTERLOCK: %s", reason)
             return RouteTarget.SAFETY_INTERLOCK, reason
 
-        # 2. Ambiguity / Low Confidence Check
-        if decision.needs_clarification(self.confidence_threshold):
+        # 2. Ambiguity / Low Confidence Check (conversational queries answer directly)
+        if decision.needs_clarification(self.confidence_threshold) and decision.intent != IntentType.CONVERSATIONAL_QUERY.value:
             reason = (
                 f"Low intent confidence ({decision.intent_confidence:.2f} < {self.confidence_threshold:.2f}). "
                 f"Needs verbal clarification."
@@ -81,25 +81,25 @@ class CommandRouter:
             reason = "Fast-path system media / volume adjustment."
             return RouteTarget.PRIORITY_1_MEDIA, reason
 
-        # 5. Form Fill & Multilingual Unicode Typing
+        # 5. Conversational Query or Knowledge Question
+        if decision.intent == IntentType.CONVERSATIONAL_QUERY.value:
+            reason = "Conversational query or knowledge question."
+            return RouteTarget.CONVERSATIONAL_QUERY, reason
+
+        # 6. Form Fill & Multilingual Unicode Typing
         if decision.is_text_injection():
             reason = (
                 f"Text injection into active focus (Multilingual: {decision.has_multilingual_content})."
             )
             return RouteTarget.TEXT_INJECTION, reason
 
-        # 6. Multi-Step GUI Workflow Automation (Priority 2 -> Priority 3)
+        # 7. Multi-Step GUI Workflow Automation (Priority 2 -> Priority 3)
         if decision.is_gui_agent_required():
             reason = (
                 f"Multi-step GUI workflow targeting '{decision.target_app}' "
                 f"(Complexity: {decision.complexity_score:.2f})."
             )
             return RouteTarget.GUI_WORKFLOW_AUTOMATION, reason
-
-        # 7. Conversational Query
-        if decision.intent == IntentType.CONVERSATIONAL_QUERY.value:
-            reason = "Conversational query or knowledge question."
-            return RouteTarget.CONVERSATIONAL_QUERY, reason
 
         # Default fallback to GUI workflow
         return RouteTarget.GUI_WORKFLOW_AUTOMATION, "Default workflow execution."

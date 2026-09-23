@@ -213,6 +213,34 @@ class JevClassifier:
                 decomposed_plan=decomposed,
             )
 
+        # Conversational / knowledge questions (who are you, what can you do, jokes, greetings)
+        conversational_triggers = (
+            "who are you", "what is your name", "what can you do", "what are your capabilities",
+            "tell me a joke", "tell me about yourself", "how are you",
+            "what is wisprhelp", "what can i ask", "koun ho", "kya kar sakte ho",
+            "namaste", "good morning", "good afternoon", "good evening", "how's it going",
+        )
+        single_words = {"hi", "hello", "hey", "help", "who"}
+        q_words = set(re.findall(r"\b\w+\b", lower_query))
+        if (
+            (decomposed and decomposed.normalized_intent == IntentType.CONVERSATIONAL_QUERY.value)
+            or any(w in lower_query for w in conversational_triggers)
+            or (bool(q_words & single_words) and len(q_words) <= 2)
+        ):
+            return JevDecision(
+                intent=IntentType.CONVERSATIONAL_QUERY.value,
+                intent_confidence=0.98,
+                target_app=TargetApp.GENERIC_OR_ACTIVE.value,
+                target_app_confidence=0.95,
+                complexity_score=0.0,
+                complexity_confidence=0.95,
+                is_destructive=False,
+                destructive_probability=0.01,
+                has_multilingual_content=has_non_ascii,
+                multilingual_probability=0.95 if has_non_ascii else 0.05,
+                raw_response={"fallback": True},
+            )
+
         # Volume / System media patterns
         media_keywords = [
             "volume", "vol", "sound", "awaaz", "audio", "percent", "%",

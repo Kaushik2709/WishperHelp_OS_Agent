@@ -159,8 +159,44 @@ class ScreenCapture:
                 timestamp=now,
             )
         except Exception as exc:
-            logger.warning("Screen capture error: %s; using fallback canvas.", exc)
-            return self._generate_fallback_frame(now)
+            logger.warning("Screen capture error via mss: %s; attempting ImageGrab fallback.", exc)
+            self._sct = None  # Reset stale GDI context
+            try:
+                from PIL import ImageGrab
+                raw_img = ImageGrab.grab()
+                if raw_img.mode != "RGB":
+                    raw_img = raw_img.convert("RGB")
+                orig_w, orig_h = raw_img.size
+
+                if max(orig_w, orig_h) > self.max_dimension:
+                    if orig_w >= orig_h:
+                        new_w = self.max_dimension
+                        new_h = max(1, int(orig_h * (self.max_dimension / orig_w)))
+                    else:
+                        new_h = self.max_dimension
+                        new_w = max(1, int(orig_w * (self.max_dimension / orig_h)))
+                    scaled_img = raw_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+                else:
+                    scaled_img = raw_img
+                    new_w, new_h = orig_w, orig_h
+
+                scale_x = orig_w / new_w
+                scale_y = orig_h / new_h
+                dhash_val = self.compute_dhash(scaled_img)
+                return ScreenFrame(
+                    image=scaled_img,
+                    width=new_w,
+                    height=new_h,
+                    original_width=orig_w,
+                    original_height=orig_h,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    dhash=dhash_val,
+                    timestamp=now,
+                )
+            except Exception as exc2:
+                logger.warning("ImageGrab fallback failed: %s; using fallback canvas.", exc2)
+                return self._generate_fallback_frame(now)
 
     def _generate_fallback_frame(self, timestamp: float) -> ScreenFrame:
         """Generates a synthetic 1920x1080 canvas for headless / CI tests."""

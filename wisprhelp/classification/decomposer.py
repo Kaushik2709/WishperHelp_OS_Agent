@@ -64,11 +64,11 @@ class SemanticDecomposer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "openai/gpt-oss-120b",
-        timeout: float = 2.5,
+        model: Optional[str] = None,
+        timeout: float = 3.0,
     ) -> None:
         self.api_key = api_key if api_key is not None else config.groq_api_key
-        self.model = model
+        self.model = model or config.groq_planner_model or "llama-3.3-70b-versatile"
         self.timeout = timeout
         self.url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -116,7 +116,7 @@ class SemanticDecomposer:
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": GROQ_DECOMPOSER_SYSTEM_PROMPT},
-                    {"role": "user", "content": clean_query + context_hint},
+                    {"role": "user", "content": f"{clean_query}{context_hint}\nRespond in valid JSON only."},
                 ],
                 "response_format": {"type": "json_object"},
                 "temperature": 0.0,
@@ -211,6 +211,32 @@ class SemanticDecomposer:
     ) -> DecomposedQuery:
         """High-speed local deterministic regex fallback when Groq is unreachable."""
         lower_q = query.lower().strip()
+
+        # 0. Conversational & Knowledge Queries (who are you, what can you do, jokes, greetings)
+        conversational_triggers = (
+            "who are you", "what is your name", "what can you do", "what are your capabilities",
+            "tell me a joke", "tell me about yourself", "how are you",
+            "what is wisprhelp", "what can i ask", "koun ho", "kya kar sakte ho",
+            "namaste", "good morning", "good afternoon", "good evening", "how's it going",
+        )
+        single_words = {"hi", "hello", "hey", "help", "who"}
+        q_words = set(re.findall(r"\b\w+\b", lower_q))
+        if any(w in lower_q for w in conversational_triggers) or (bool(q_words & single_words) and len(q_words) <= 2):
+            return DecomposedQuery(
+                original_query=query,
+                target_app=None,
+                is_compound=False,
+                normalized_intent=IntentType.CONVERSATIONAL_QUERY.value,
+                sub_queries=[
+                    DecomposedStep(
+                        step_number=1,
+                        query_text=query,
+                        action_type="conversational_query",
+                        target=None,
+                        payload=query,
+                    )
+                ],
+            )
 
         # 1. Media commands
         if any(w in lower_q for w in ("volume", "vol", "sound", "awaaz", "mute", "unmute")):
