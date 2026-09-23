@@ -64,10 +64,35 @@ class Config:
             os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
         ).strip()
     )
+    gemini_model: str = field(
+        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+    )
+    openai_api_key: str = field(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    openai_base_url: str = field(
+        default_factory=lambda: os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    )
+    openai_model: str = field(
+        default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o").strip()
+    )
 
-    # Speech-to-Text (Ear)
+    # Speech-to-Text & Strategic Planning (Ear & Brain)
     groq_api_key: str = field(
         default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip()
+    )
+    groq_planner_model: str = field(
+        default_factory=lambda: os.getenv("GROQ_PLANNER_MODEL", "openai/gpt-oss-120b").strip()
+    )
+
+    # Jev-Grounded Computer-Use Options ("Decide, Don't Generate")
+    enable_set_of_marks: bool = field(
+        default_factory=lambda: os.getenv("ENABLE_SET_OF_MARKS", "true").lower()
+        in ("1", "true", "yes")
+    )
+    postcondition_verification_enabled: bool = field(
+        default_factory=lambda: os.getenv("POSTCONDITION_VERIFICATION_ENABLED", "true").lower()
+        in ("1", "true", "yes")
     )
 
     # Execution limits & Guardrails

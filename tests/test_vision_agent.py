@@ -77,10 +77,17 @@ def test_vlm_agent_bounded_execution():
     mock_hal = MagicMock()
     agent = VLMAgent(os_adapter=mock_hal, max_steps=5)
 
-    result = agent.execute_visual_task(goal="Find search box and type hello")
-    assert result is not None
-    assert result.steps_taken <= 5
-    assert len(result.action_history) > 0
+    mock_res = {
+        "success": True,
+        "steps_taken": 2,
+        "message": "Found search box",
+        "history": [{"step": 1, "action": "click"}],
+    }
+    with patch.object(agent.grounded_agent, "execute_goal", return_value=mock_res):
+        result = agent.execute_visual_task(goal="Find search box and type hello")
+        assert result is not None
+        assert result.steps_taken <= 5
+        assert len(result.action_history) > 0
 
 
 def test_vlm_agent_emergency_abort():

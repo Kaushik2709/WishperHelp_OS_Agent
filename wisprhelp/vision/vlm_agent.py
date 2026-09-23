@@ -15,6 +15,7 @@ from wisprhelp.config import config
 from wisprhelp.hal.base import BaseOSAdapter
 from wisprhelp.hal.factory import get_os_adapter
 from wisprhelp.vision.capture import ScreenCapture, ScreenFrame
+from wisprhelp.vision.grounded_agent import GroundedActionAgent
 from wisprhelp.vision.grounding import CoordinateGrounding
 
 logger = logging.getLogger(__name__)
@@ -38,19 +39,27 @@ class VLMAgent:
         os_adapter: Optional[BaseOSAdapter] = None,
         max_steps: int = 15,
         capture: Optional[ScreenCapture] = None,
+        grounded_agent: Optional[GroundedActionAgent] = None,
     ) -> None:
         self.os_adapter = os_adapter or get_os_adapter()
         self.max_steps = min(max_steps, 15)  # Strict contract: max 15 steps
         self.capture = capture or ScreenCapture()
+        self.grounded_agent = grounded_agent or GroundedActionAgent(
+            os_adapter=self.os_adapter,
+            capture=self.capture,
+            max_steps=self.max_steps,
+        )
         self._abort_flag = False
 
     def abort(self) -> None:
         """Signals immediate emergency abort."""
         logger.critical("Emergency abort signal received in VLMAgent.")
         self._abort_flag = True
+        self.grounded_agent.abort()
 
     def reset_abort(self) -> None:
         self._abort_flag = False
+        self.grounded_agent.reset_abort()
 
     def execute_visual_task(
         self,
@@ -72,8 +81,36 @@ class VLMAgent:
         """
         if reset_abort_on_start:
             self.reset_abort()
+
+        # Immediate check for abort flag
+        if self._abort_flag:
+            logger.warning("Visual task called but abort flag is active.")
+            return VisionActionResult(
+                success=False,
+                steps_taken=0,
+                message="Aborted via emergency kill-switch.",
+                aborted=True,
+                action_history=[],
+            )
+
         logger.info("Starting System Two Visual Loop for goal: '%s' (max_steps=%d)", goal, self.max_steps)
 
+        # 1. Grounded Set-of-Marks Execution Path (Decide, Don't Generate)
+        if config.enable_set_of_marks and config.gemini_api_key:
+            res = self.grounded_agent.execute_goal(
+                goal=goal,
+                target_app=target_app,
+                step_callback=step_callback,
+            )
+            return VisionActionResult(
+                success=res.get("success", False),
+                steps_taken=res.get("steps_taken", 0),
+                message=res.get("message", "Grounded execution complete."),
+                aborted=res.get("aborted", False),
+                action_history=res.get("history", []),
+            )
+
+        # 2. Fallback to iterative coordinate-based ReAct loop
         history: List[Dict[str, Any]] = []
         consecutive_stagnant_steps = 0
         last_frame: Optional[ScreenFrame] = None
@@ -282,13 +319,13 @@ class VLMAgent:
             },
         }
 
-        # Candidate models with resilient quota fallback (gemini-3.1-flash-lite and gemini-3-flash-preview active & responsive)
+        # Candidate models with resilient quota fallback (gemini-3.6-flash verified active & responsive)
         candidate_models = [
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview",
+            config.gemini_model,
             "gemini-3.6-flash",
             "gemini-3.5-flash",
             "gemini-flash-latest",
+            "gemini-3.1-flash-lite",
             "gemini-2.5-flash-lite",
         ]
 

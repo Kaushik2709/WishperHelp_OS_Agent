@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from wisprhelp.classification.classifier import JevClassifier
 from wisprhelp.classification.schemas import JevDecision, TargetApp
+from wisprhelp.core.groq_planner import GroqStrategicPlanner
 from wisprhelp.core.router import CommandRouter, RouteTarget
 from wisprhelp.core.safety import SafetyGate
 from wisprhelp.hal.base import BaseOSAdapter
@@ -45,6 +46,7 @@ class RuntimeCoordinator:
         safety_gate: Optional[SafetyGate] = None,
         os_adapter: Optional[BaseOSAdapter] = None,
         vlm_agent: Optional[VLMAgent] = None,
+        planner: Optional[GroqStrategicPlanner] = None,
         hud: Optional[StatusOverlayHUD] = None,
         feedback: Optional[AudioFeedback] = None,
     ) -> None:
@@ -53,6 +55,7 @@ class RuntimeCoordinator:
         self.safety_gate = safety_gate or SafetyGate()
         self.os_adapter = os_adapter or get_os_adapter()
         self.vlm_agent = vlm_agent or VLMAgent(os_adapter=self.os_adapter)
+        self.planner = planner or GroqStrategicPlanner()
         self.hud = hud
         self.feedback = feedback
 
@@ -254,16 +257,17 @@ class RuntimeCoordinator:
                 latency_ms=elapsed,
             )
 
-        # Conversational Query
+        # Conversational Query (System Two Groq / Generative Synthesizer)
+        reply = self.planner.answer_conversational(user_query)
         elapsed = (time.perf_counter() - start_time) * 1000
         if self.hud:
-            self.hud.set_state(HUDState.IDLE, "Ready")
+            self.hud.set_state(HUDState.IDLE, reply[:30])
         if self.feedback:
             self.feedback.play_success()
         return ExecutionResult(
             success=True,
             route=route,
-            message=f"Conversational request received: '{user_query}'",
+            message=reply,
             decision=decision,
             latency_ms=elapsed,
         )
