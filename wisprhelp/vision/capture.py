@@ -30,6 +30,8 @@ class ScreenFrame:
     scale_y: float  # original_height / height
     dhash: int
     timestamp: float
+    offset_x: int = 0
+    offset_y: int = 0
 
     def to_base64_jpeg(self, quality: int = 80) -> str:
         """Converts frame to compact base64 JPEG string for VLM payload."""
@@ -116,7 +118,7 @@ class ScreenCapture:
 
         # Handle headless or virtual environments
         if not sct:
-            return self._generate_fallback_frame(now)
+            raise RuntimeError("Screen capture unavailable; refusing synthetic grounding")
 
         try:
             # Monitor 1 is primary monitor; monitor 0 is all monitors combined
@@ -157,6 +159,8 @@ class ScreenCapture:
                 scale_y=scale_y,
                 dhash=dhash_val,
                 timestamp=now,
+                offset_x=target_mon.get("left", 0),
+                offset_y=target_mon.get("top", 0),
             )
         except Exception as exc:
             logger.warning("Screen capture error via mss: %s; attempting ImageGrab fallback.", exc)
@@ -195,8 +199,7 @@ class ScreenCapture:
                     timestamp=now,
                 )
             except Exception as exc2:
-                logger.warning("ImageGrab fallback failed: %s; using fallback canvas.", exc2)
-                return self._generate_fallback_frame(now)
+                raise RuntimeError("All screen capture backends unavailable") from exc2
 
     def _generate_fallback_frame(self, timestamp: float) -> ScreenFrame:
         """Generates a synthetic 1920x1080 canvas for headless / CI tests."""

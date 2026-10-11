@@ -69,7 +69,7 @@ class CoordinateGrounding:
         clamped_x = max(0, min(frame.original_width - 1, orig_x))
         clamped_y = max(0, min(frame.original_height - 1, orig_y))
 
-        return offset_x + clamped_x, offset_y + clamped_y
+        return offset_x + frame.offset_x + clamped_x, offset_y + frame.offset_y + clamped_y
 
     @staticmethod
     def bbox_to_center(

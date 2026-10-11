@@ -84,7 +84,10 @@ def test_vlm_agent_bounded_execution():
         "history": [{"step": 1, "action": "click"}],
     }
     with patch.object(agent.grounded_agent, "execute_goal", return_value=mock_res):
-        result = agent.execute_visual_task(goal="Find search box and type hello")
+        with patch("wisprhelp.vision.vlm_agent.config") as cfg:
+            cfg.enable_set_of_marks = True
+            cfg.gemini_api_key = "test-key"
+            result = agent.execute_visual_task(goal="Find search box", allowed_actions={"click"})
         assert result is not None
         assert result.steps_taken <= 5
         assert len(result.action_history) > 0
@@ -103,6 +106,55 @@ def test_vlm_agent_emergency_abort():
     assert result.steps_taken == 0
 
 
+def test_scoped_visual_click_rejects_unrelated_action():
+    hal = MagicMock()
+    capture = MagicMock()
+    capture.capture.return_value = MagicMock()
+    agent = VLMAgent(os_adapter=hal, capture=capture)
+    agent._decide_next_action = MagicMock(return_value={"type": "type_text", "params": {"text": "surprise"}})
+    with patch("wisprhelp.vision.vlm_agent.config") as cfg:
+        cfg.enable_set_of_marks = False
+        cfg.anthropic_api_key = "test-key"
+        result = agent.execute_visual_task("Click Save", allowed_actions={"click"})
+    assert not result.success
+    hal.inject_unicode_text.assert_not_called()
+    hal.click.assert_not_called()
+
+
+def test_scoped_visual_click_dispatches_once():
+    hal = MagicMock()
+    capture = MagicMock()
+    frame = MagicMock()
+    frame.width = frame.screen_width = 1000
+    frame.height = frame.screen_height = 1000
+    frame.original_width = frame.original_height = 1000
+    frame.scale_x = frame.scale_y = 1
+    capture.capture.return_value = frame
+    agent = VLMAgent(os_adapter=hal, capture=capture)
+    agent._decide_next_action = MagicMock(return_value={"type": "click", "params": {"x": 100, "y": 200}})
+    with patch("wisprhelp.vision.vlm_agent.config") as cfg:
+        cfg.enable_set_of_marks = False
+        cfg.anthropic_api_key = "test-key"
+        result = agent.execute_visual_task("Click Save", allowed_actions={"click"})
+    assert result.success
+    assert result.steps_taken == 1
+    hal.click.assert_called_once()
+
+
+def test_visual_model_failure_never_simulates_click():
+    hal = MagicMock()
+    capture = MagicMock()
+    agent = VLMAgent(os_adapter=hal, capture=capture)
+    with patch("wisprhelp.vision.vlm_agent.config") as cfg:
+        cfg.enable_set_of_marks = False
+        cfg.anthropic_api_key = "test-key"
+        cfg.gemini_api_key = None
+        with patch.object(agent, "_call_anthropic_computer_use", side_effect=RuntimeError("offline")):
+            result = agent.execute_visual_task("Click Save", allowed_actions={"click"})
+    assert not result.success
+    hal.click.assert_not_called()
+
+
 def test_vlm_agent_429_quota_handling():
     """Verify that HTTP 429 quota exhaustion from Gemini returns success=False with clear message."""
     mock_hal = MagicMock()
@@ -113,6 +165,7 @@ def test_vlm_agent_429_quota_handling():
     mock_resp.text = '{"error": {"code": 429, "message": "Resource has been exhausted (e.g. check quota)."}}'
 
     mock_config = MagicMock()
+    mock_config.enable_set_of_marks = False  # Exercise this module's coordinate-based HTTP client.
     mock_config.gemini_api_key = "mock_gemini_key"
     mock_config.anthropic_api_key = None
 

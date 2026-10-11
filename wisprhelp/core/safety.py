@@ -7,12 +7,23 @@ from __future__ import annotations
 
 import logging
 import threading
+import re
 from typing import Callable, Optional
 
 from wisprhelp.classification.schemas import JevDecision
 from wisprhelp.config import config
 
 logger = logging.getLogger(__name__)
+
+
+def is_explicit_confirmation(response: str) -> bool:
+    """Accept a complete consent phrase; text containing 'yes' is not consent."""
+    clean = re.sub(r"[.!?,]+$", "", response.casefold().strip()).strip()
+    return clean in {
+        "yes", "yes please", "yes i confirm", "yes, i confirm", "confirm", "i confirm",
+        "proceed", "go ahead", "do it", "sure", "ok", "okay", "haan", "haan ji", "ha",
+        "yes, proceed", "yes proceed", "yes, we do", "yes we do",
+    }
 
 
 class EmergencyKillSwitchTriggered(Exception):
@@ -24,7 +35,7 @@ class SafetyGate:
     """Evaluates destructive risk and manages confirmation gates."""
 
     def __init__(self, risk_threshold: Optional[float] = None) -> None:
-        self.risk_threshold = risk_threshold or config.destructive_risk_threshold
+        self.risk_threshold = config.destructive_risk_threshold if risk_threshold is None else risk_threshold
         self._pending_action: Optional[JevDecision] = None
         self._lock = threading.Lock()
 
@@ -51,10 +62,7 @@ class SafetyGate:
             if not self._pending_action:
                 return None
 
-            clean_response = user_confirmation.lower().strip()
-            affirmative_tokens = ("yes", "confirm", "proceed", "do it", "sure", "ha", "haan")
-
-            if any(tok in clean_response.split() or clean_response == tok for tok in affirmative_tokens):
+            if is_explicit_confirmation(user_confirmation):
                 action = self._pending_action
                 self._pending_action = None
                 logger.info("User confirmed high-risk action: %s", action.intent)

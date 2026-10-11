@@ -1,0 +1,4 @@
+# WisprHelp Portable USB Root Anchor Marker
+# This file marks the root directory of the WisprHelp USB installation.
+# All paths (models, state, config, logs, runtime) resolve relative to this file.
+VERSION=1.0.0

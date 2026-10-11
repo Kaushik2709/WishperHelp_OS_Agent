@@ -142,6 +142,16 @@ class MicrophoneStream:
             self._stream.start()
             self._is_running = True
 
+            try:
+                default_input = sd.query_devices(kind="input")
+                logger.info(
+                    "Capturing from default input device: '%s' (max in: %.0f%%)",
+                    default_input.get("name", "unknown"),
+                    float(default_input.get("max_input_channels", 0)),
+                )
+            except Exception:
+                pass
+
             self._worker_thread = threading.Thread(target=self._vad_worker, daemon=True)
             self._worker_thread.start()
             logger.info("MicrophoneStream recording started at %d Hz.", self.sample_rate)

@@ -1,5 +1,7 @@
 # Product Requirements Document (PRD): WisprHelp Universal OS AI Agent
 
+**Evidence note (2026-10-11):** historical design requirements and performance targets are not proof of implemented or validated behavior. See [EVALUATION_REPORT.md](EVALUATION_REPORT.md) for the current execution contract and platform evidence.
+
 **Document Version:** 1.1.0  
 **Status:** Approved / In Execution  
 **Target Platforms:** Windows 10/11, macOS (Ventura+), Linux (Ubuntu 22.04+, X11 & Wayland)  

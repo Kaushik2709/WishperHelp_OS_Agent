@@ -10,7 +10,8 @@ import io
 import json
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional
+import math
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
 from PIL import Image
@@ -22,6 +23,8 @@ from wisprhelp.vision.capture import ScreenCapture, ScreenFrame
 from wisprhelp.vision.grounded_schemas import ActionType, CandidateCatalog, GroundedDecision
 from wisprhelp.vision.postcondition import PostconditionVerifier
 from wisprhelp.vision.som_annotator import SetOfMarksAnnotator
+from wisprhelp.core.outcomes import ExecutionFault, FailureCode
+from wisprhelp.hal.base import WindowInfo
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ class GroundedActionAgent:
         self.capture = capture or ScreenCapture()
         self.annotator = annotator or SetOfMarksAnnotator(os_adapter=self.os_adapter)
         self.verifier = verifier or PostconditionVerifier()
-        self.max_steps = min(max_steps, config.max_agent_steps)
+        self.max_steps = max(1, min(max_steps, config.max_agent_steps, 15))
         self._abort_flag = False
 
     def abort(self) -> None:
@@ -58,6 +61,8 @@ class GroundedActionAgent:
         target_app: Optional[str] = None,
         step_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         reset_abort_on_start: bool = False,
+        allowed_actions: Optional[Set[str]] = None,
+        approved_target: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Runs the iterative Set-of-Marks grounded perception-action loop.
 
@@ -94,6 +99,7 @@ class GroundedActionAgent:
                 }
 
             # 1. Capture current screen state
+            window_before = self.os_adapter.get_active_window()
             current_frame = self.capture.capture()
 
             # 2. Check for visual stagnation (loop prevention)
@@ -136,6 +142,15 @@ class GroundedActionAgent:
                     step_callback(step, {"thought": decision.thought, "action": decision.action_type})
                 except Exception:
                     pass
+            # Models/callbacks can take seconds; recheck before dispatch.
+            if self._abort_flag:
+                return {"success": False, "steps_taken": step - 1, "aborted": True,
+                        "message": "Emergency stop before dispatch.", "history": history,
+                        "failure_code": FailureCode.EMERGENCY_STOP}
+            current_window = self.os_adapter.get_active_window()
+            if isinstance(window_before, WindowInfo) and current_window != window_before:
+                return {"success": False, "steps_taken": step - 1, "history": history,
+                        "message": "Foreground changed while grounding.", "failure_code": FailureCode.FOCUS_CHANGED}
 
             history_entry = {
                 "step": step,
@@ -144,15 +159,59 @@ class GroundedActionAgent:
                 "candidate_id": decision.chosen_candidate_id,
                 "text": decision.typed_text,
             }
+            if not math.isfinite(decision.confidence) or decision.confidence < config.intent_confidence_threshold:
+                return {"success": False, "steps_taken": step - 1, "history": history,
+                        "message": "Grounding confidence too low.", "failure_code": FailureCode.INCORRECT_GROUNDING}
+            if decision.action_type not in ("finish", "abort") and allowed_actions is None:
+                return {"success": False, "steps_taken": step - 1, "history": history,
+                        "message": "Vision requires a scoped approved action.", "failure_code": FailureCode.UNAUTHORIZED}
+            candidate = catalog.get(decision.chosen_candidate_id) if decision.chosen_candidate_id is not None else None
+            if candidate and not (current_frame.offset_x <= candidate.center[0] < current_frame.offset_x + current_frame.original_width
+                                  and current_frame.offset_y <= candidate.center[1] < current_frame.offset_y + current_frame.original_height):
+                return {"success": False, "steps_taken": step - 1, "history": history,
+                        "message": "Candidate lies outside the captured monitor.", "failure_code": FailureCode.INCORRECT_GROUNDING}
+            if candidate and (not candidate.is_enabled or (approved_target and not approved_target.startswith("ordinal:")
+                    and approved_target.casefold() not in candidate.label.casefold())):
+                return {"success": False, "steps_taken": step - 1, "history": history,
+                        "message": "Candidate does not match the approved target.", "failure_code": FailureCode.INCORRECT_GROUNDING}
+
+            if allowed_actions is not None and decision.action_type not in allowed_actions | {ActionType.FINISH.value, ActionType.ABORT.value}:
+                history.append(history_entry)
+                return {"success": False, "steps_taken": step,
+                        "message": "Vision proposed an action outside the approved step.", "history": history}
+
+            # Ungrounded click guard: a click with no valid candidate ID would be
+            # a blind dispatch. Abort immediately instead of burning the step
+            # budget (and multiple VLM calls) on repeated ungroundable decisions.
+            if decision.action_type in (
+                ActionType.CLICK.value,
+                ActionType.DOUBLE_CLICK.value,
+                ActionType.RIGHT_CLICK.value,
+            ) and (
+                decision.chosen_candidate_id is None
+                or catalog.get(decision.chosen_candidate_id) is None
+            ):
+                history.append(history_entry)
+                logger.warning(
+                    "Vision decision requested a click without a valid grounded candidate. Aborting loop."
+                )
+                return {
+                    "success": False,
+                    "steps_taken": step,
+                    "message": "Vision could not ground the target element on screen; no click was performed.",
+                    "history": history,
+                    "failure_code": FailureCode.INCORRECT_GROUNDING,
+                }
 
             # 6. Check termination
             if decision.action_type == ActionType.FINISH.value:
                 logger.info("GroundedActionAgent finished goal at step %d: %s", step, decision.thought)
                 history.append(history_entry)
                 return {
-                    "success": True,
+                    "success": False,
                     "steps_taken": step,
-                    "message": decision.thought or "Goal achieved successfully.",
+                    "message": ("No scoped action was performed." if allowed_actions is not None
+                                else decision.thought or "Goal achieved successfully."),
                     "history": history,
                 }
             elif decision.action_type == ActionType.ABORT.value:
@@ -186,8 +245,18 @@ class GroundedActionAgent:
                 history_entry["verify_details"] = post_res.details
                 if not post_res.verified:
                     logger.warning("Step %d postcondition unconfirmed: %s", step, post_res.details)
+                    history.append(history_entry)
+                    return {"success": False, "steps_taken": step, "message": post_res.details,
+                            "history": history, "failure_code": FailureCode.POSTCONDITION_FAILED}
 
             history.append(history_entry)
+            if allowed_actions is not None:
+                verified = config.postcondition_verification_enabled and post_res.verified
+                return {"success": verified, "steps_taken": step,
+                        "message": "Scoped grounded action verified." if verified else "Postcondition verification disabled.",
+                        "postcondition_verified": verified,
+                        "failure_code": FailureCode.NONE if verified else FailureCode.POSTCONDITION_FAILED,
+                        "history": history}
             last_frame = post_frame
 
         return {
@@ -210,6 +279,9 @@ class GroundedActionAgent:
             target_x, target_y = node.center
 
         action = decision.action_type
+        if self._abort_flag:
+            raise ExecutionFault(FailureCode.EMERGENCY_STOP, "Emergency stop before grounded input")
+        self.os_adapter.check_emergency_stop()
 
         if action == ActionType.CLICK.value:
             if target_x is not None and target_y is not None:
@@ -221,7 +293,7 @@ class GroundedActionAgent:
         elif action == ActionType.DOUBLE_CLICK.value:
             if target_x is not None and target_y is not None:
                 logger.info("Grounded Double-Click on Candidate [%d] at (%d, %d)", node.candidate_id, target_x, target_y)
-                self.os_adapter.double_click(target_x, target_y)
+                self.os_adapter.click(target_x, target_y, clicks=2)
 
         elif action == ActionType.RIGHT_CLICK.value:
             if target_x is not None and target_y is not None:
@@ -233,6 +305,8 @@ class GroundedActionAgent:
             if target_x is not None and target_y is not None:
                 self.os_adapter.click(target_x, target_y)
                 time.sleep(0.1)
+                if self._abort_flag:
+                    raise ExecutionFault(FailureCode.EMERGENCY_STOP, "Emergency stop before text input")
             if decision.typed_text:
                 logger.info("Injecting unicode text: '%s'", decision.typed_text[:30])
                 self.os_adapter.inject_unicode_text(decision.typed_text)
@@ -244,7 +318,7 @@ class GroundedActionAgent:
 
         elif action == ActionType.SCROLL.value:
             # Default scroll down
-            self.os_adapter.scroll(clicks=-3)
+            self.os_adapter.scroll(direction="down", amount=3)
 
     def _decide_candidate_action(
         self,
@@ -259,8 +333,8 @@ class GroundedActionAgent:
         api_key = config.gemini_api_key
         if not api_key:
             return GroundedDecision(
-                thought="No Gemini API key available; finishing.",
-                action_type=ActionType.FINISH.value,
+                thought="No vision model is available; cannot verify or perform the action.",
+                action_type=ActionType.ABORT.value,
             )
 
         candidate_text = catalog.to_prompt_context(max_items=40)
@@ -309,21 +383,22 @@ CRITICAL RULES:
             },
         }
 
-        # Try configured model first, then resilient fallbacks
-        configured = config.gemini_model if config.gemini_model and not config.gemini_model.startswith("gemini-3") else "gemini-2.5-flash"
+        # Try configured model first, then verified-fast fallbacks (measured <5s for
+        # 1080p grounding). Dead 404 models removed; slow 2.5-flash demoted to last.
         models_to_try = [
-            configured,
+            config.gemini_model,
+            "gemini-3.1-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.6-flash",
             "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
         ]
         seen = set()
-        deduped_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+        deduped_models = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
-        for m in deduped_models:
+        for attempt_idx, m in enumerate(deduped_models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={api_key}"
             try:
-                resp = requests.post(url, json=payload, timeout=12.0)
+                resp = requests.post(url, json=payload, timeout=25.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()

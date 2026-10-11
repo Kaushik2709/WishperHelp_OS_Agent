@@ -1,5 +1,7 @@
 # Runtime Agent Harness Specification (`HARNESS.md`)
 
+**Evidence note (2026-10-11):** historical design requirements and performance targets are not proof of implemented or validated behavior. See [EVALUATION_REPORT.md](EVALUATION_REPORT.md) for the current execution contract and platform evidence.
+
 **Document Version:** 1.1.0  
 **Target:** WisprHelp Runtime Engine & Execution Orchestrator  
 

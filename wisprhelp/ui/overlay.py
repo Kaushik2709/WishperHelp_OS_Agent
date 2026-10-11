@@ -194,9 +194,16 @@ class StatusOverlayHUD:
         """Hides HUD and terminates Qt event loop."""
         with self._lock:
             self._running = False
+            if self._window is not None:
+                try:
+                    from PySide6.QtCore import QMetaObject, Qt
+                    QMetaObject.invokeMethod(self._window, "close", Qt.QueuedConnection)
+                except Exception:
+                    pass
             if self._app is not None:
                 try:
-                    self._app.quit()
+                    from PySide6.QtCore import QMetaObject, Qt
+                    QMetaObject.invokeMethod(self._app, "quit", Qt.QueuedConnection)
                 except Exception:
                     pass
             self._window = None

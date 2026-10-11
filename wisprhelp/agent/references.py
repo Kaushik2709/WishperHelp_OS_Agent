@@ -221,7 +221,7 @@ class ReferenceResolver:
     def _extract_ordinal_index(phrase: str) -> Optional[Tuple[int, Optional[str]]]:
         """Extracts 0-based or negative index from ordinal phrase."""
         pos_map = {
-            "first": 0, "1st": 0, "top": 0, "pehla": 0,
+            "first": 0, "1st": 0, "top": 0, "pehla": 0, "firsti": 0, "firstly": 0,
             "second": 1, "2nd": 1, "doosra": 1,
             "third": 2, "3rd": 2, "teesra": 2,
             "fourth": 3, "4th": 3,
@@ -229,15 +229,35 @@ class ReferenceResolver:
             "last": -1, "bottom": -1, "aakhri": -1,
             "second-last": -2, "penultimate": -2,
         }
-        item_types = ["tab", "result", "chat", "button", "item", "row", "link", "window", "file", "folder"]
+
+        # Item type resolution with voice/stt synonyms
         found_type = None
-        for it in item_types:
-            if it in phrase:
-                found_type = it
-                break
+        lower = phrase.lower()
+        if "chat" in lower or ("set" in lower and "setting" not in lower):
+            found_type = "chat"
+        elif any(w in lower for w in ("file", "doc", "document", "docx", "pdf")):
+            found_type = "file"
+        elif "folder" in lower or "directory" in lower:
+            found_type = "folder"
+        elif "tab" in lower:
+            found_type = "tab"
+        elif "button" in lower or "btn" in lower:
+            found_type = "button"
+        elif "row" in lower:
+            found_type = "row"
+        elif "link" in lower:
+            found_type = "link"
+        elif "item" in lower or "result" in lower:
+            found_type = "item"
+
+        # Check explicit position/number: e.g. "position 1", "number 2", "pos 3"
+        m_pos = re.search(r"\b(?:position|pos|number|no\.?)\s*(\d+)\b", lower)
+        if m_pos:
+            num = int(m_pos.group(1))
+            return (max(0, num - 1), found_type)
 
         for word, idx in pos_map.items():
-            if re.search(rf"\b{re.escape(word)}\b", phrase):
+            if re.search(rf"\b{re.escape(word)}\b", lower):
                 return (idx, found_type)
 
         return None

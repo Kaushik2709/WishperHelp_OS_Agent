@@ -39,13 +39,15 @@ def test_postcondition_terminating_actions():
     assert res_abort.verified is True
 
 
-def test_postcondition_type_text_success_on_screen_mutation():
+def test_postcondition_type_text_requires_accessible_text_match():
     verifier = PostconditionVerifier()
     # Different dHash indicates screen responded
     f1 = _create_frame((0, 0, 0), 0b1111)
     f2 = _create_frame((255, 255, 255), 0b0000)
 
-    res = verifier.verify(f1, f2, action_type=ActionType.TYPE_TEXT.value, typed_text="hello")
+    hal = MagicMock()
+    hal.read_focused_text.return_value = "hello"
+    res = verifier.verify(f1, f2, action_type=ActionType.TYPE_TEXT.value, typed_text="hello", os_adapter=hal)
     assert res.verified is True
     assert res.text_matched is True
     assert res.dhash_distance > 0

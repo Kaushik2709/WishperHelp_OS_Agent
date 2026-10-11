@@ -65,7 +65,7 @@ class Config:
         ).strip()
     )
     gemini_model: str = field(
-        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
     )
     openai_api_key: str = field(
         default_factory=lambda: os.getenv("OPENAI_API_KEY", "").strip()
@@ -82,7 +82,7 @@ class Config:
         default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip()
     )
     groq_planner_model: str = field(
-        default_factory=lambda: os.getenv("GROQ_PLANNER_MODEL", "llama-3.3-70b-versatile").strip()
+        default_factory=lambda: os.getenv("GROQ_PLANNER_MODEL", "openai/gpt-oss-120b").strip()
     )
 
     # Jev-Grounded Computer-Use Options ("Decide, Don't Generate")

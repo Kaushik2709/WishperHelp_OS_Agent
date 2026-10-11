@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "mode": "mocked",
+  "environment": {
+    "os": "Windows",
+    "release": "11",
+    "python": "3.14.3",
+    "timestamp_utc": "2026-10-11T08:53:04.038128+00:00",
+    "voice_tested": false,
+    "models_tested": false
+  },
+  "tasks": [
+    {
+      "task": "mock_multistep_unicode_navigation",
+      "completion": "successful",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 3,
+      "native_input_calls": 5,
+      "step_attempts": 3,
+      "file_action_attempts": 0,
+      "latency_ms": 22.067,
+      "recovery_attempts": 0,
+      "unsafe_or_unauthorized_attempts": 0,
+      "failure_code": "none",
+      "outcomes": [
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        },
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        },
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        }
+      ]
+    },
+    {
+      "task": "mock_missing_accessibility_target",
+      "completion": "failed",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 1,
+      "native_input_calls": 0,
+      "step_attempts": 1,
+      "file_action_attempts": 0,
+      "latency_ms": 0.042,
+      "recovery_attempts": 0,
+      "unsafe_or_unauthorized_attempts": 0,
+      "failure_code": "accessibility_target_not_found",
+      "outcomes": [
+        {
+          "success": false,
+          "failure_code": "accessibility_target_not_found",
+          "needs_confirmation": false,
+          "dispatched": false
+        }
+      ]
+    },
+    {
+      "task": "mock_approved_alternative_after_missing_target",
+      "completion": "successful",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 2,
+      "native_input_calls": 1,
+      "step_attempts": 2,
+      "file_action_attempts": 0,
+      "latency_ms": 0.052,
+      "recovery_attempts": 1,
+      "unsafe_or_unauthorized_attempts": 0,
+      "failure_code": "accessibility_target_not_found",
+      "outcomes": [
+        {
+          "success": false,
+          "failure_code": "accessibility_target_not_found",
+          "needs_confirmation": false,
+          "dispatched": false
+        },
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        }
+      ]
+    },
+    {
+      "task": "mock_cancel_between_steps",
+      "completion": "partial",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 2,
+      "native_input_calls": 1,
+      "step_attempts": 2,
+      "file_action_attempts": 0,
+      "latency_ms": 0.044,
+      "recovery_attempts": 0,
+      "unsafe_or_unauthorized_attempts": 0,
+      "failure_code": "cancelled",
+      "outcomes": [
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        },
+        {
+          "success": false,
+          "failure_code": "cancelled",
+          "needs_confirmation": false,
+          "dispatched": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "successful": 2,
+    "partial": 1,
+    "failed": 1,
+    "not_run": 0,
+    "expected_behaviors_verified": 4
+  }
+}

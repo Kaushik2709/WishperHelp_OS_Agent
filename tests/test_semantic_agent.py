@@ -25,9 +25,11 @@ from unittest.mock import MagicMock, patch
 from wisprhelp.agent.actions import Action, ActionType
 from wisprhelp.agent.memory import ConversationMemory
 from wisprhelp.agent.planner import SemanticAgent, TaskGraph
-from wisprhelp.agent.reasoning import SemanticReasoner
+from wisprhelp.agent.plan_classifier import PlanClassifier
+from wisprhelp.agent.reasoning import SemanticReasoner, GoalUnderstanding
 from wisprhelp.agent.references import ReferenceResolver
 from wisprhelp.agent.state import ComputerState, ComputerStateManager, UIElementInfo
+from wisprhelp.classification.client import JevClient
 from wisprhelp.core.runtime import RuntimeCoordinator, RouteTarget
 from wisprhelp.hal.base import BaseOSAdapter, WindowInfo
 
@@ -68,6 +70,7 @@ class MockOSAdapter(BaseOSAdapter):
 
     def launch_app(self, app_identifier: str, parameter: str = None) -> bool:
         self.launched_apps.append(app_identifier)
+        self.active_window = WindowInfo(app_identifier, app_identifier + ".exe", 1234, (0, 0, 1920, 1080))
         return True
 
     def get_active_window(self) -> WindowInfo:
@@ -127,11 +130,17 @@ class TestSemanticAgentScenarios(unittest.TestCase):
         self.mock_classifier.classify.return_value = MagicMock(
             is_high_risk=lambda thresh: False,
         )
+        # Keyless plan classifier: existing scenarios run fully offline
+        # (LLM-only metrics, no real Jev API calls).
+        keyless_client = JevClient()
+        keyless_client.api_key = ""  # force offline; empty ctor arg falls back to config
+        self.offline_plan_classifier = PlanClassifier(client=keyless_client)
         self.agent = SemanticAgent(
             os_adapter=self.os_adapter,
             ref_resolver=self.ref_resolver,
             reasoner=self.reasoner,
             classifier=self.mock_classifier,
+            plan_classifier=self.offline_plan_classifier,
         )
         def _mock_visual_task(goal: str, **kwargs):
             if "plus" in goal.lower():
@@ -152,7 +161,7 @@ class TestSemanticAgentScenarios(unittest.TestCase):
     def test_scenario_b_file_search_and_open(self) -> None:
         """Scenario B: 'Find the PDF I downloaded today and open it.'"""
         res = self.agent.process_turn("Find the PDF I downloaded today and open it")
-        self.assertTrue(res.success)
+        self.assertTrue(res.success, res.message)
         self.assertIn("PDF", res.goal)
         # Actions should include find_file or open_file
         action_types = [a.type for a in res.actions_executed]
@@ -162,7 +171,7 @@ class TestSemanticAgentScenarios(unittest.TestCase):
         """Scenario C: 'Open my resume.' then 'Now copy the email address from it.'"""
         # Turn 1
         res1 = self.agent.process_turn("Open my resume")
-        self.assertTrue(res1.success)
+        self.assertTrue(res1.success, res1.message)
         self.assertEqual(self.agent.memory.entity_store.get_last_entity("files"), "resume.pdf")
 
         # Turn 2: 'Now copy the email address from it.'
@@ -239,7 +248,12 @@ class TestSemanticAgentScenarios(unittest.TestCase):
 
     def test_scenario_k_destructive_operation_guardrail(self) -> None:
         """Scenario K: 'Delete everything in this folder' must require confirmation."""
+        # The model supplies the action; the deterministic executor owns consent.
+        self.reasoner.analyze = MagicMock(return_value=GoalUnderstanding(
+            raw_query="Delete everything in this folder", primary_goal="Delete selected items",
+            initial_actions=[Action(type=ActionType.PRESS_KEY, target="delete", is_destructive=True)]))
         res = self.agent.process_turn("Delete everything in this folder")
+        self.assertNotIn("delete", self.os_adapter.pressed_keys)
         self.assertTrue(res.needs_confirmation)
         self.assertIn("destructive", res.message.lower())
         self.assertIsNotNone(res.confirmation_prompt)

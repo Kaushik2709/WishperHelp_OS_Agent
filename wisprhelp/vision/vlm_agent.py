@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import time
+import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from wisprhelp.config import config
 from wisprhelp.hal.base import BaseOSAdapter
@@ -17,6 +18,9 @@ from wisprhelp.hal.factory import get_os_adapter
 from wisprhelp.vision.capture import ScreenCapture, ScreenFrame
 from wisprhelp.vision.grounded_agent import GroundedActionAgent
 from wisprhelp.vision.grounding import CoordinateGrounding
+from wisprhelp.vision.postcondition import PostconditionVerifier
+from wisprhelp.core.outcomes import ExecutionFault, FailureCode
+from wisprhelp.hal.base import WindowInfo
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,8 @@ class VisionActionResult:
     message: str
     aborted: bool = False
     action_history: List[Dict[str, Any]] = field(default_factory=list)
+    failure_code: FailureCode = FailureCode.NONE
+    postcondition_verified: Optional[bool] = None
 
 
 class VLMAgent:
@@ -42,7 +48,7 @@ class VLMAgent:
         grounded_agent: Optional[GroundedActionAgent] = None,
     ) -> None:
         self.os_adapter = os_adapter or get_os_adapter()
-        self.max_steps = min(max_steps, 15)  # Strict contract: max 15 steps
+        self.max_steps = max(1, min(max_steps, 15))  # Strict contract: max 15 steps
         self.capture = capture or ScreenCapture()
         self.grounded_agent = grounded_agent or GroundedActionAgent(
             os_adapter=self.os_adapter,
@@ -62,11 +68,33 @@ class VLMAgent:
         self.grounded_agent.reset_abort()
 
     def execute_visual_task(
+        self, goal: str, target_app: Optional[str] = None, step_callback=None,
+        reset_abort_on_start: bool = False, allowed_actions: Optional[Set[str]] = None,
+        approved_target: Optional[str] = None,
+    ) -> VisionActionResult:
+        try:
+            result = self._execute_visual_task(goal, target_app, step_callback, reset_abort_on_start,
+                                               allowed_actions, approved_target)
+            if result.aborted:
+                result.failure_code = FailureCode.EMERGENCY_STOP
+            elif not result.success and result.failure_code == FailureCode.NONE:
+                result.failure_code = FailureCode.INCORRECT_GROUNDING
+            return result
+        except Exception as exc:
+            code = exc.code if isinstance(exc, ExecutionFault) else (
+                FailureCode.EMERGENCY_STOP if type(exc).__name__ in ("FailSafeException", "EmergencyKillSwitchTriggered")
+                else FailureCode.ACTION_TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.API_UNAVAILABLE)
+            return VisionActionResult(False, 0, f"Vision stopped: {type(exc).__name__}",
+                                      aborted=code == FailureCode.EMERGENCY_STOP, failure_code=code)
+
+    def _execute_visual_task(
         self,
         goal: str,
         target_app: Optional[str] = None,
         step_callback: Optional[callable] = None,
         reset_abort_on_start: bool = False,
+        allowed_actions: Optional[Set[str]] = None,
+        approved_target: Optional[str] = None,
     ) -> VisionActionResult:
         """Runs the bounded visual ReAct loop to complete the desktop user goal.
 
@@ -93,6 +121,10 @@ class VLMAgent:
                 action_history=[],
             )
 
+        if not (config.gemini_api_key or config.anthropic_api_key):
+            return VisionActionResult(False, 0, "No vision model is configured for a grounded action.",
+                                      failure_code=FailureCode.API_UNAVAILABLE)
+
         logger.info("Starting System Two Visual Loop for goal: '%s' (max_steps=%d)", goal, self.max_steps)
 
         # 1. Grounded Set-of-Marks Execution Path (Decide, Don't Generate)
@@ -101,6 +133,8 @@ class VLMAgent:
                 goal=goal,
                 target_app=target_app,
                 step_callback=step_callback,
+                allowed_actions=allowed_actions,
+                approved_target=approved_target,
             )
             return VisionActionResult(
                 success=res.get("success", False),
@@ -108,9 +142,15 @@ class VLMAgent:
                 message=res.get("message", "Grounded execution complete."),
                 aborted=res.get("aborted", False),
                 action_history=res.get("history", []),
+                failure_code=res.get("failure_code", FailureCode.NONE),
+                postcondition_verified=res.get("success", False),
             )
 
         # 2. Fallback to iterative coordinate-based ReAct loop
+        if approved_target is not None:
+            return VisionActionResult(False, 0,
+                                      "A named target requires labeled candidate grounding; coordinate-only fallback was refused.",
+                                      failure_code=FailureCode.INCORRECT_GROUNDING)
         history: List[Dict[str, Any]] = []
         consecutive_stagnant_steps = 0
         last_frame: Optional[ScreenFrame] = None
@@ -125,9 +165,11 @@ class VLMAgent:
                     message="Aborted via emergency kill-switch.",
                     aborted=True,
                     action_history=history,
+                    failure_code=FailureCode.CANCELLED,
                 )
 
             # 2. Capture and downscale current screen
+            window_before = self.os_adapter.get_active_window()
             current_frame = self.capture.capture()
 
             # 3. Check for UI stagnation
@@ -154,6 +196,14 @@ class VLMAgent:
                     step_callback(step, action)
                 except Exception:
                     pass
+            if self._abort_flag:
+                return VisionActionResult(False, step - 1, "Emergency stop before dispatch.", aborted=True, action_history=history)
+            if isinstance(window_before, WindowInfo) and self.os_adapter.get_active_window() != window_before:
+                return VisionActionResult(False, step - 1, "Foreground changed while grounding.", action_history=history,
+                                          failure_code=FailureCode.FOCUS_CHANGED)
+            if self.os_adapter.has_unexpected_modal() is True:
+                return VisionActionResult(False, step - 1, "Unexpected dialog before vision input.", action_history=history,
+                                          failure_code=FailureCode.UNEXPECTED_MODAL)
 
             history.append({
                 "step": step,
@@ -162,20 +212,50 @@ class VLMAgent:
                 "thought": action.get("thought", ""),
             })
 
+            if allowed_actions is not None and action.get("type") not in allowed_actions | {"finish", "error"}:
+                return VisionActionResult(False, step, "Vision proposed an action outside the approved step.", action_history=history)
+            if allowed_actions is not None and action.get("type") not in {"finish", "error"}:
+                params = action.get("params") or {}
+                if action.get("type") not in {"click", "double_click"} or not all(
+                    isinstance(params.get(axis), (int, float)) for axis in ("x", "y")
+                ):
+                    return VisionActionResult(False, step, "Vision did not return a supported grounded click.", action_history=history)
+            if action.get("type") not in {"finish", "error"} and allowed_actions is None:
+                return VisionActionResult(False, step - 1, "Vision requires a scoped approved action.", action_history=history,
+                                          failure_code=FailureCode.UNAUTHORIZED)
+            if action.get("type") in {"click", "double_click", "right_click"}:
+                params = action.get("params") or {}
+                if any(isinstance(params.get(axis), bool) or not isinstance(params.get(axis), (float, int))
+                       or not math.isfinite(params[axis]) or not 0 <= params[axis] < limit
+                       for axis, limit in (("x", current_frame.width), ("y", current_frame.height))):
+                    return VisionActionResult(False, step - 1, "Coordinates outside observed frame.", action_history=history,
+                                              failure_code=FailureCode.INCORRECT_GROUNDING)
+
             # 5. Check if goal is finished or encountered fatal error
             if action.get("type") in ("finish", "error"):
                 msg = action.get("params", {}).get("message", "Done")
-                is_ok = action.get("type") == "finish" and "error" not in msg.lower() and "status" not in msg.lower()
+                is_ok = False  # A model's 'done' is not an independently verified goal.
+                if allowed_actions is not None:
+                    is_ok = False  # A scoped step requires an actual dispatched action.
                 logger.info("VLMAgent %s at step %d: %s", "completed goal" if is_ok else "stopped with error", step, msg)
                 return VisionActionResult(
                     success=is_ok,
                     steps_taken=step,
                     message=msg,
                     action_history=history,
+                    failure_code=FailureCode.API_UNAVAILABLE if action.get("type") == "error" else FailureCode.POSTCONDITION_FAILED,
                 )
 
             # 6. Execute hardware action via OS HAL
             self._dispatch_hal_action(action, current_frame)
+            if allowed_actions is not None:
+                time.sleep(0.3)
+                post = self.capture.capture()
+                verification = PostconditionVerifier().verify(current_frame, post, action.get("type"), os_adapter=self.os_adapter)
+                history[-1]["verified"] = verification.verified
+                return VisionActionResult(verification.verified, step, verification.details, action_history=history,
+                                          failure_code=FailureCode.NONE if verification.verified else FailureCode.POSTCONDITION_FAILED,
+                                          postcondition_verified=verification.verified)
             last_frame = current_frame
 
             # Bounded sleep to allow OS window animation/rendering
@@ -210,8 +290,9 @@ class VLMAgent:
             except Exception as exc:
                 logger.error("Gemini VLM error: %s; falling back.", exc)
 
-        # 3. Deterministic offline fallback simulator
-        return self._offline_simulated_action(goal, history)
+        return {"type": "error", "params": {
+            "message": "No vision model could ground the requested screen action."
+        }}
 
     def _call_anthropic_computer_use(
         self,
@@ -319,21 +400,24 @@ class VLMAgent:
             },
         }
 
-        # Candidate models with resilient quota fallback (gemini-3.6-flash verified active & responsive)
+        # Candidate models: verified-fast 1080p vision models first (grounded decisions
+        # measured in <5s), slow/legacy models last as rescue options. Dead models
+        # (gemini-2.0-flash, gemini-1.5-flash, gemini-2.5-flash-lite: HTTP 404) removed.
         candidate_models = [
             config.gemini_model,
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
-            "gemini-flash-latest",
             "gemini-3.1-flash-lite",
-            "gemini-2.5-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.6-flash",
+            "gemini-2.5-flash",
         ]
+        seen = set()
+        candidate_models = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
 
         last_error_msg = "No response from Gemini API"
-        for model_name in candidate_models:
+        for attempt_idx, model_name in enumerate(candidate_models):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
             try:
-                resp = requests.post(url, json=payload, timeout=12)
+                resp = requests.post(url, json=payload, timeout=25)
                 if resp.status_code == 200:
                     data = resp.json()
                     raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -361,20 +445,13 @@ class VLMAgent:
         logger.error("All candidate Gemini models failed or exceeded quota.")
         return {"type": "error", "params": {"message": last_error_msg}}
 
-    def _offline_simulated_action(self, goal: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Offline simulation for test suites and environments without active frontier API keys."""
-        step_num = len(history) + 1
-        if step_num == 1:
-            # First step: move to center or click focus
-            return {"type": "click", "params": {"x": 500, "y": 500}, "thought": "Focus target window"}
-        else:
-            # Second step: complete task
-            return {"type": "finish", "params": {"message": f"Successfully automated '{goal}'."}, "thought": "Done"}
-
     def _dispatch_hal_action(self, action: Dict[str, Any], frame: ScreenFrame) -> None:
         """Maps high-level action to OS HAL operations with coordinate translation."""
         action_type = action.get("type")
         params = action.get("params", {})
+        if self._abort_flag:
+            raise ExecutionFault(FailureCode.EMERGENCY_STOP, "Emergency stop before visual input")
+        self.os_adapter.check_emergency_stop()
 
         if action_type == "click":
             raw_x = params.get("x", 0)
@@ -386,9 +463,11 @@ class VLMAgent:
             raw_x = params.get("x", 0)
             raw_y = params.get("y", 0)
             screen_x, screen_y = CoordinateGrounding.frame_coords_to_screen_pixels(raw_x, raw_y, frame)
-            self.os_adapter.click(screen_x, screen_y)
-            time.sleep(0.05)
-            self.os_adapter.click(screen_x, screen_y)
+            self.os_adapter.click(screen_x, screen_y, clicks=2)
+
+        elif action_type == "right_click":
+            screen_x, screen_y = CoordinateGrounding.frame_coords_to_screen_pixels(params["x"], params["y"], frame)
+            self.os_adapter.click(screen_x, screen_y, button="right")
 
         elif action_type == "type_text":
             text = params.get("text", "")

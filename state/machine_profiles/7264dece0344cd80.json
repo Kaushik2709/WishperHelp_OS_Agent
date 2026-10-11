@@ -1,0 +1,19 @@
+{
+  "machine_hash": "7264dece0344cd80",
+  "os_name": "Windows",
+  "os_release": "11",
+  "os_version": "10.0.26200",
+  "cpu_arch": "AMD64",
+  "cpu_cores": 6,
+  "cpu_threads": 12,
+  "total_ram_gb": 15.77,
+  "available_ram_gb": 5.24,
+  "gpu_available": true,
+  "gpu_name": "Intel(R) UHD Graphics 730",
+  "gpu_vram_gb": 2.0,
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "optimal_threads": 6,
+  "supports_gpu_offload": false,
+  "created_at": 1791267576.5108755
+}

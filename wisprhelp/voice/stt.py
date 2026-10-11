@@ -10,10 +10,18 @@ import io
 import logging
 import wave
 from typing import Optional
+from dataclasses import dataclass
 
 from wisprhelp.config import config
+from wisprhelp.core.outcomes import FailureCode
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    text: str
+    failure_code: FailureCode = FailureCode.NONE
 
 
 class WhisperSTT:
@@ -29,12 +37,13 @@ class WhisperSTT:
         self.model = model
         self.language_prompt = language_prompt
         self._groq_client = None
+        self.last_failure = FailureCode.NONE
 
         if self.api_key:
             try:
                 from groq import Groq
 
-                self._groq_client = Groq(api_key=self.api_key)
+                self._groq_client = Groq(api_key=self.api_key, timeout=15.0, max_retries=1)
                 logger.info("Initialized Groq Whisper Large v3 client.")
             except ImportError:
                 logger.warning("groq library not found. Will use mock transcription fallback.")
@@ -138,13 +147,25 @@ class WhisperSTT:
         Returns:
             str: Transcribed text query.
         """
+        self.last_failure = FailureCode.NONE
         if not pcm_audio:
             return ""
 
-        # Check if audio has sufficient energy above ambient background noise
+        # Check if audio has sufficient energy above ambient background noise.
+        # Threshold 40 accommodates quiet microphones (ambient noise typically
+        # measures RMS 10-25; quiet-mic speech measures 50+). Groq Whisper
+        # itself rejects non-speech, and sanitize_transcription filters
+        # hallucinations, so the gate only needs to catch true silence.
         rms = self._compute_rms(pcm_audio)
-        if rms < 70.0:
-            logger.debug("Audio energy too low for STT (RMS=%.1f < 70). Skipping.", rms)
+        duration_s = len(pcm_audio) / (sample_rate * 2)
+        if rms < 40.0:
+            logger.warning(
+                "STT skipped: audio energy too low (RMS=%.1f < 40 over %.1fs). "
+                "Check that the correct microphone is the Windows default input, "
+                "it is not muted, and mic volume/boost is adequate.",
+                rms,
+                duration_s,
+            )
             return ""
 
         wav_bytes = self.pcm_to_wav_bytes(pcm_audio, sample_rate=sample_rate)
@@ -168,10 +189,17 @@ class WhisperSTT:
                     logger.info("Groq STT returned filtered/empty text (raw: '%s')", raw_text)
                 return cleaned
             except Exception as exc:
+                self.last_failure = FailureCode.API_UNAVAILABLE
                 logger.error("Groq Whisper API call failed: %s. Reverting to fallback.", exc)
 
         # 2. Secondary fallback: Local or mock transcription
+        self.last_failure = FailureCode.API_UNAVAILABLE
         return self._offline_transcribe(pcm_audio)
+
+    def transcribe_result(self, pcm_audio: bytes, sample_rate: int = 16000) -> TranscriptionResult:
+        """Structured speech outcome; silence remains distinct from engine failure."""
+        text = self.transcribe(pcm_audio, sample_rate)
+        return TranscriptionResult(text, self.last_failure)
 
     def _offline_transcribe(self, pcm_audio: bytes) -> str:
         """Fallback transcription when Groq API is unavailable."""

@@ -1,0 +1,16 @@
+python-dotenv
+requests
+pydantic
+Pillow
+mss
+pyautogui
+pyperclip
+psutil
+PySide6
+groq
+pynput
+numpy
+sounddevice
+pyttsx3
+pywin32; sys_platform == "win32"
+uiautomation; sys_platform == "win32"

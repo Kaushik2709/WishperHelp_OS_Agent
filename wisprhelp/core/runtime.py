@@ -9,16 +9,20 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from wisprhelp.agent.planner import SemanticAgent, AgentTurnResult
+from wisprhelp.agent.planner import SemanticAgent, AgentTurnResult, TaskTrace
+from wisprhelp.agent.reasoning import SemanticReasoner
 from wisprhelp.classification.classifier import JevClassifier
 from wisprhelp.classification.schemas import JevDecision, TargetApp
 from wisprhelp.core.groq_planner import GroqStrategicPlanner
 from wisprhelp.core.router import CommandRouter, RouteTarget
 from wisprhelp.core.safety import SafetyGate
 from wisprhelp.hal.base import BaseOSAdapter
+from wisprhelp.hal.guarded import GuardedOSAdapter
+from wisprhelp.core.outcomes import ExecutionFault, FailureCode
 from wisprhelp.hal.factory import get_os_adapter
 from wisprhelp.ui.overlay import StatusOverlayHUD, HUDState
 from wisprhelp.vision.vlm_agent import VLMAgent
@@ -35,6 +39,10 @@ class ExecutionResult:
     message: str
     decision: Optional[JevDecision] = None
     latency_ms: float = 0.0
+    failure_code: FailureCode = FailureCode.NONE
+    postcondition_verified: Optional[bool] = None
+    degraded_reason: Optional[str] = None
+    needs_confirmation: bool = False
 
 
 class RuntimeCoordinator:
@@ -55,7 +63,13 @@ class RuntimeCoordinator:
         self.classifier = classifier or JevClassifier()
         self.router = router or CommandRouter()
         self.safety_gate = safety_gate or SafetyGate()
-        self.os_adapter = os_adapter or get_os_adapter()
+        self._cancelled = threading.Event()
+        self._command_lock = threading.Lock()
+        self._legacy_running = False
+        self._legacy_window = None
+        self._legacy_deadline = None
+        native_adapter = os_adapter or get_os_adapter()
+        self.os_adapter = GuardedOSAdapter(native_adapter, self._checkpoint)
         self.vlm_agent = vlm_agent or VLMAgent(os_adapter=self.os_adapter)
         self.planner = planner or GroqStrategicPlanner()
         self.hud = hud
@@ -66,15 +80,131 @@ class RuntimeCoordinator:
             safety_gate=self.safety_gate,
         )
 
+    def _checkpoint(self, operation="input"):
+        if self._cancelled.is_set():
+            raise ExecutionFault(FailureCode.CANCELLED, "Execution cancelled; no further input allowed.")
+        self.os_adapter.check_emergency_stop()
+        if self._legacy_running:
+            from wisprhelp.hal.base import WindowInfo
+            if self._legacy_deadline and time.perf_counter() >= self._legacy_deadline:
+                raise ExecutionFault(FailureCode.ACTION_TIMEOUT, "Command deadline exceeded.")
+            if operation in ("launch_app", "focus_window"):
+                self._legacy_window = None
+            elif operation != "complete":
+                if self.os_adapter.has_unexpected_modal() is True:
+                    raise ExecutionFault(FailureCode.UNEXPECTED_MODAL, "Unexpected dialog before input.")
+                current = self.os_adapter.get_active_window()
+                if isinstance(self._legacy_window, WindowInfo) and current != self._legacy_window:
+                    raise ExecutionFault(FailureCode.FOCUS_CHANGED, "Foreground changed before input.")
+                self._legacy_window = current
+
+    def cancel(self, emergency=False):
+        self._cancelled.set()
+        self.safety_gate.cancel_pending()
+        self.agent.abort(emergency=emergency)
+        self.vlm_agent.abort()
+
+    def reset_abort(self):
+        if self._command_lock.locked():
+            raise RuntimeError("Cannot reset stop while a command is running")
+        self.agent.reset_abort()
+        self._cancelled.clear()
+        self.vlm_agent.reset_abort()
+
     def process_turn_semantic(
+        self, user_query: str, confirmation_response: Optional[str] = None,
+    ) -> AgentTurnResult:
+        if SemanticReasoner._is_interruption(user_query.lower().strip()):
+            self.cancel()
+            return self.agent.process_turn(user_query)
+        if not self._command_lock.acquire(blocking=False):
+            trace = TaskTrace(user_query, "", "", "", {}, success=False, failure_code=FailureCode.BUSY)
+            return AgentTurnResult(False, "Another command is running.", "", trace, failure_code=FailureCode.BUSY)
+        try:
+            self._checkpoint()
+            return self._process_turn_semantic(user_query, confirmation_response)
+        except ExecutionFault as exc:
+            trace = TaskTrace(user_query, "", "", "", {}, success=False, failure_code=exc.code)
+            return AgentTurnResult(False, str(exc), "", trace, failure_code=exc.code)
+        finally:
+            self._command_lock.release()
+
+    def _process_turn_semantic(
         self,
         user_query: str,
         confirmation_response: Optional[str] = None,
     ) -> AgentTurnResult:
-        """Processes user goal using the dynamic SemanticAgent cognitive brain."""
-        return self.agent.process_turn(user_query, confirmation_response)
+        """Processes user goal using the dynamic SemanticAgent cognitive brain.
+
+        The Groq model understands the instruction with a narrow offline fallback.
+        Every plan passes the same confidence/risk gates before the bounded
+        TaskGraph executor applies actions against live screen state.
+        """
+        start_time = time.perf_counter()
+        if self.hud:
+            self.hud.set_state(HUDState.THINKING, f"Understanding: {user_query[:30]}")
+
+        result = self.agent.process_turn(user_query, confirmation_response)
+
+        if self.hud:
+            if result.needs_confirmation:
+                self.hud.set_state(HUDState.CONFIRM, "Confirmation Required")
+            elif getattr(result, "success", False):
+                self.hud.set_state(HUDState.IDLE, "Ready")
+            else:
+                self.hud.set_state(HUDState.ERROR, "Action Failed")
+        if self.feedback:
+            try:
+                if result.needs_confirmation:
+                    self.feedback.play_warning()
+                elif getattr(result, "success", False):
+                    self.feedback.play_success()
+                else:
+                    self.feedback.play_abort()
+            except Exception:
+                pass
+        # Keep latency authoritative from the agent turn itself
+        if not getattr(result, "latency_ms", 0.0):
+            result.latency_ms = (time.perf_counter() - start_time) * 1000
+        return result
 
     def process_command(
+        self, user_query: str, confirmation_response: Optional[str] = None,
+        decision: Optional[JevDecision] = None,
+    ) -> ExecutionResult:
+        if SemanticReasoner._is_interruption(user_query.lower().strip()):
+            self.cancel()
+            return ExecutionResult(False, RouteTarget.CONVERSATIONAL_QUERY, "Execution cancelled.",
+                                   failure_code=FailureCode.CANCELLED)
+        if not self._command_lock.acquire(blocking=False):
+            return ExecutionResult(False, RouteTarget.CLARIFY, "Another command is running.", failure_code=FailureCode.BUSY)
+        start = time.perf_counter()
+        try:
+            self._legacy_running = True
+            self._legacy_deadline = start + 30.0
+            self._checkpoint()
+            result = self._process_command(user_query, confirmation_response, decision)
+            self._checkpoint("complete")
+            if result.decision and result.decision.raw_response.get("degraded_reason"):
+                from dataclasses import replace
+                result = replace(result, degraded_reason=result.decision.raw_response["degraded_reason"])
+            if not result.success and result.failure_code == FailureCode.NONE:
+                from dataclasses import replace
+                result = replace(result, failure_code=FailureCode.ACTION_FAILED)
+            return result
+        except Exception as exc:
+            code = exc.code if isinstance(exc, ExecutionFault) else (
+                FailureCode.EMERGENCY_STOP if type(exc).__name__ in ("FailSafeException", "EmergencyKillSwitchTriggered")
+                else FailureCode.ACTION_TIMEOUT if isinstance(exc, TimeoutError) else FailureCode.API_UNAVAILABLE)
+            return ExecutionResult(False, RouteTarget.CLARIFY, f"Command stopped: {type(exc).__name__}",
+                                   latency_ms=(time.perf_counter() - start) * 1000, failure_code=code)
+        finally:
+            self._legacy_running = False
+            self._legacy_window = None
+            self._legacy_deadline = None
+            self._command_lock.release()
+
+    def _process_command(
         self,
         user_query: str,
         confirmation_response: Optional[str] = None,
@@ -113,6 +243,11 @@ class RuntimeCoordinator:
         # 0b. First-class literal text dictation distinction (e.g. Type: "open Chrome and search for Jev")
         literal_text = self.agent.reasoner._extract_literal_text_dictation(user_query)
         if literal_text is not None:
+            active = self.os_adapter.get_active_window()
+            if any(name in active.process_name.casefold() for name in ("powershell", "cmd.exe", "terminal", "bash", "zsh")):
+                return ExecutionResult(False, RouteTarget.SAFETY_INTERLOCK,
+                                       "Terminal input requires action-bound confirmation through the semantic interface.",
+                                       failure_code=FailureCode.UNAUTHORIZED)
             if self.hud:
                 self.hud.set_state(HUDState.EXECUTING, f"Typing: {literal_text[:20]}")
             ok = self.os_adapter.inject_unicode_text(literal_text)
@@ -148,6 +283,8 @@ class RuntimeCoordinator:
                 message=sem_turn.message,
                 decision=decision,
                 latency_ms=elapsed,
+                failure_code=sem_turn.failure_code,
+                needs_confirmation=sem_turn.needs_confirmation,
             )
 
         # Handle pending safety confirmation resolution
@@ -180,14 +317,18 @@ class RuntimeCoordinator:
         if decision is None:
             decision = self.classifier.classify(user_query, os_context=context)
 
+        # Known risky commands cannot rely solely on a model's destructive flag.
+        if re.search(r"\b(delete|erase|wipe|format|send|submit|pay|purchase|buy|uninstall|shutdown)\b", user_query, re.IGNORECASE):
+            from dataclasses import replace
+            decision = replace(decision, is_destructive=True)
+
         # 3. Confidence & Risk Routing
         route, reason = self.router.route(decision)
 
-        # Compound command resolution: If router flagged CLARIFY or PRIORITY_1_LAUNCH,
-        # but the query contains compound actions, promote to GUI_WORKFLOW_AUTOMATION.
+        # A confident launch may include follow-up steps; clarification stays blocked.
         parsed_app, in_app_cmd = self._parse_app_and_command(user_query, decision.target_app)
         has_compound_plan = bool(decision.decomposed_plan and decision.decomposed_plan.is_compound)
-        if (route in (RouteTarget.CLARIFY, RouteTarget.PRIORITY_1_LAUNCH)) and (in_app_cmd or has_compound_plan):
+        if route == RouteTarget.PRIORITY_1_LAUNCH and (in_app_cmd or has_compound_plan):
             logger.info("Promoting route '%s' to GUI_WORKFLOW_AUTOMATION for compound query: '%s'", route.value, user_query)
             route = RouteTarget.GUI_WORKFLOW_AUTOMATION
 
@@ -210,11 +351,13 @@ class RuntimeCoordinator:
             if self.hud:
                 self.hud.set_state(HUDState.IDLE, "Clarification Needed")
             return ExecutionResult(
-                success=True,
+                success=False,
                 route=route,
                 message=f"Clarification required: {reason}",
                 decision=decision,
                 latency_ms=elapsed,
+                failure_code=(FailureCode.INVALID_CLASSIFICATION if decision.raw_response.get("invalid_classification") or reason.startswith("Invalid")
+                              else FailureCode.LOW_CONFIDENCE),
             )
 
         if route == RouteTarget.SAFETY_INTERLOCK:
@@ -230,6 +373,7 @@ class RuntimeCoordinator:
                 message=prompt,
                 decision=decision,
                 latency_ms=elapsed,
+                needs_confirmation=True,
             )
 
         if route == RouteTarget.PRIORITY_1_LAUNCH:
@@ -237,7 +381,7 @@ class RuntimeCoordinator:
             if self.hud:
                 self.hud.set_state(HUDState.EXECUTING, f"Launching {target_app}")
             launched = self.os_adapter.launch_app(target_app)
-            self.os_adapter.wait_for_active_window([target_app], timeout=1.5)
+            focused = launched and self.os_adapter.wait_for_active_window([target_app], timeout=1.5)
             elapsed = (time.perf_counter() - start_time) * 1000
 
             # If the user also specified an in-app command, execute it like a real human!
@@ -257,11 +401,14 @@ class RuntimeCoordinator:
             if self.feedback:
                 self.feedback.play_success()
             return ExecutionResult(
-                success=launched,
+                success=bool(launched and focused),
                 route=route,
                 message=msg,
                 decision=decision,
                 latency_ms=elapsed,
+                failure_code=(FailureCode.TARGET_APP_MISSING if not launched else
+                              FailureCode.POSTCONDITION_FAILED if not focused else FailureCode.NONE),
+                postcondition_verified=bool(focused),
             )
 
         # Check for media/volume command override before other pathways
@@ -358,6 +505,8 @@ class RuntimeCoordinator:
                 message=res.message,
                 decision=decision,
                 latency_ms=elapsed,
+                failure_code=res.failure_code,
+                postcondition_verified=res.postcondition_verified,
             )
 
         # Conversational Query (System Two Groq / Generative Synthesizer)
@@ -381,18 +530,18 @@ class RuntimeCoordinator:
         start_time: float,
     ) -> ExecutionResult:
         """Executes an action after positive user confirmation."""
-        # Execute based on intent
-        if decision.intent == "direct_app_launch":
-            ok = self.os_adapter.launch_app(decision.target_app)
-        else:
-            ok = True
+        # This legacy interface does not retain a typed, target-bound action.
+        # Never treat a confirmation itself as evidence of execution.
+        ok = False
         elapsed = (time.perf_counter() - start_time) * 1000
         return ExecutionResult(
             success=ok,
             route=RouteTarget.SAFETY_INTERLOCK,
-            message="Confirmed high-risk action executed successfully.",
+            message=("Confirmed high-risk launch dispatched." if ok else
+                     "Confirmed high-risk action has no supported legacy executor. Use the semantic task interface."),
             decision=decision,
             latency_ms=elapsed,
+            failure_code=FailureCode.NONE if ok else FailureCode.UNAUTHORIZED,
         )
 
     def _execute_gui_workflow(
@@ -423,8 +572,15 @@ class RuntimeCoordinator:
         if target_app and target_app != TargetApp.GENERIC_OR_ACTIVE.value:
             if self.hud:
                 self.hud.set_state(HUDState.EXECUTING, f"Focusing {target_app}")
-            self.os_adapter.launch_app(target_app)
-            self.os_adapter.wait_for_active_window([target_app], timeout=2.0)
+            launched = self.os_adapter.launch_app(target_app)
+            if not launched:
+                return ExecutionResult(False, RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                                       "Target application could not be launched.", decision,
+                                       failure_code=FailureCode.TARGET_APP_MISSING)
+            if not self.os_adapter.wait_for_active_window([target_app], timeout=2.0):
+                return ExecutionResult(False, RouteTarget.GUI_WORKFLOW_AUTOMATION,
+                                       "Target application did not become foreground.", decision,
+                                       failure_code=FailureCode.POSTCONDITION_FAILED)
             time.sleep(0.5)
 
         # Step 2: If there is an in-app command, execute it like a real human user

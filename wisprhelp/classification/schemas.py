@@ -120,7 +120,7 @@ class JevDecision:
 
     def is_high_risk(self, threshold: float = 0.65) -> bool:
         """Checks if the action has an unacceptably high destructive probability."""
-        return self.destructive_probability >= threshold
+        return self.is_destructive or self.destructive_probability >= threshold
 
     def needs_clarification(self, threshold: float = 0.60) -> bool:
         """Checks if the intent confidence is too low to proceed safely."""

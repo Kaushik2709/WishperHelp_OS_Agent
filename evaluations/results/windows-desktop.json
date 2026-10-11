@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "mode": "desktop",
+  "environment": {
+    "os": "Windows",
+    "release": "11",
+    "python": "3.14.3",
+    "timestamp_utc": "2026-10-11T08:45:37.097659+00:00",
+    "voice_tested": false,
+    "models_tested": false
+  },
+  "tasks": [
+    {
+      "task": "desktop_fixture",
+      "completion": "failed",
+      "expected_behavior_met": false,
+      "reason": "Evaluation refused input outside fixture",
+      "failure_code": "focus_changed",
+      "fixture_ready": true,
+      "native_win32_available": true,
+      "uia_available": true
+    }
+  ],
+  "summary": {
+    "successful": 0,
+    "partial": 0,
+    "failed": 1,
+    "not_run": 0,
+    "expected_behaviors_verified": 0
+  }
+}

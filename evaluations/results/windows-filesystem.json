@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "mode": "filesystem",
+  "environment": {
+    "os": "Windows",
+    "release": "11",
+    "python": "3.14.3",
+    "timestamp_utc": "2026-10-11T08:53:04.432645+00:00",
+    "voice_tested": false,
+    "models_tested": false
+  },
+  "tasks": [
+    {
+      "task": "native_create_append_read",
+      "completion": "successful",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 3,
+      "native_input_calls": 0,
+      "step_attempts": 3,
+      "file_action_attempts": 2,
+      "latency_ms": 1.432,
+      "recovery_attempts": 0,
+      "unsafe_or_unauthorized_attempts": 0,
+      "failure_code": "none",
+      "outcomes": [
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        },
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": true
+        },
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": false,
+          "dispatched": false
+        }
+      ]
+    },
+    {
+      "task": "native_overwrite_requires_confirmation",
+      "completion": "failed",
+      "expected_behavior_met": true,
+      "postcondition_verified": true,
+      "tool_actions": 1,
+      "native_input_calls": 0,
+      "step_attempts": 1,
+      "file_action_attempts": 0,
+      "latency_ms": 0.235,
+      "recovery_attempts": 0,
+      "unsafe_or_unauthorized_attempts": 1,
+      "failure_code": "none",
+      "outcomes": [
+        {
+          "success": true,
+          "failure_code": "none",
+          "needs_confirmation": true,
+          "dispatched": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "successful": 1,
+    "partial": 0,
+    "failed": 1,
+    "not_run": 0,
+    "expected_behaviors_verified": 2
+  }
+}

@@ -25,7 +25,7 @@ class MacOSAdapter(BaseOSAdapter):
     """Native macOS implementation."""
 
     def __init__(self) -> None:
-        pyautogui.FAILSAFE = config.kill_switch_enabled
+        pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
 
     def launch_app(self, app_identifier: str, parameter: Optional[str] = None) -> bool:
@@ -45,7 +45,7 @@ class MacOSAdapter(BaseOSAdapter):
             cmd.extend(["--args", parameter])
 
         try:
-            subprocess.Popen(cmd)
+            subprocess.run(cmd, check=True, timeout=3.0)
             logger.info("Launched macOS app: %s", cmd)
             return True
         except Exception as exc:
@@ -63,7 +63,7 @@ class MacOSAdapter(BaseOSAdapter):
         end tell
         """
         try:
-            output = subprocess.check_output(["osascript", "-e", script], text=True).strip()
+            output = subprocess.check_output(["osascript", "-e", script], text=True, timeout=3.0).strip()
             parts = output.split("||")
             app_name = parts[0] if len(parts) > 0 else "Finder"
             pid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
@@ -102,6 +102,8 @@ class MacOSAdapter(BaseOSAdapter):
             time.sleep(0.04)
             return True
         except Exception as exc:
+            if type(exc).__name__ in ("FailSafeException", "EmergencyKillSwitchTriggered"):
+                raise
             logger.error("Failed to inject unicode text on macOS: %s", exc)
             return False
         finally:
@@ -116,7 +118,7 @@ class MacOSAdapter(BaseOSAdapter):
         cmd = command.lower().strip()
         script = ""
         if cmd in ("mute", "unmute"):
-            script = "set volume output muted not (output muted of (get volume settings))"
+            script = "set volume output muted " + ("true" if cmd == "mute" else "false")
         elif cmd in ("vol_up", "volume_up"):
             script = "set volume output volume ((output volume of (get volume settings)) + 10)"
         elif cmd in ("vol_down", "volume_down"):
@@ -132,7 +134,7 @@ class MacOSAdapter(BaseOSAdapter):
             return False
 
         try:
-            subprocess.run(["osascript", "-e", script], check=True)
+            subprocess.run(["osascript", "-e", script], check=True, timeout=3.0)
             return True
         except Exception as exc:
             logger.error("Error executing macOS media control: %s", exc)
@@ -142,7 +144,7 @@ class MacOSAdapter(BaseOSAdapter):
         self, query: str, control_type: Optional[str] = None
     ) -> Optional[Tuple[int, int]]:
         """Priority 2: Queries macOS Accessibility via AppleScript UI elements."""
-        clean_query = query.replace('"', '\\"').strip()
+        clean_query = query.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ").strip()
         script = f"""
         tell application "System Events"
             set frontApp to first application process whose frontmost is true
@@ -159,7 +161,7 @@ class MacOSAdapter(BaseOSAdapter):
         end tell
         """
         try:
-            out = subprocess.check_output(["osascript", "-e", script], text=True).strip()
+            out = subprocess.check_output(["osascript", "-e", script], text=True, timeout=3.0).strip()
             if out and out != "NOT_FOUND" and "," in out:
                 x, y, w, h = map(int, out.split(","))
                 center_x = x + w // 2

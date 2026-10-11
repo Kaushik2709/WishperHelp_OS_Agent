@@ -1,0 +1,11 @@
+# Offline/headless contracts do not load speech models, Qt, or native UI hooks.
+pytest
+python-dotenv
+requests
+pydantic
+Pillow
+mss
+pyautogui
+pyperclip
+psutil
+numpy

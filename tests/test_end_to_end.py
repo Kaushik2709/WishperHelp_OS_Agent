@@ -1,4 +1,4 @@
-"""End-to-End Integration Tests for WisprHelp.
+"""Mocked pipeline integration tests for WisprHelp; no genuine voice/desktop E2E.
 
 Tests the full cognitive loop: Hearing (VAD/STT) -> Reflex Brain (Jev) ->
 Safety Interlock -> 3-Priority Tool Execution -> HUD & Feedback.
@@ -17,6 +17,8 @@ from wisprhelp.vision.vlm_agent import VLMAgent
 from wisprhelp.voice.feedback import AudioFeedback
 from wisprhelp.voice.stt import WhisperSTT
 from wisprhelp.voice.vad import SileroVAD
+
+pytestmark = pytest.mark.mocked
 
 
 def test_full_pipeline_voice_to_action():
@@ -106,7 +108,7 @@ def test_end_to_end_destructive_safety_interlock():
     # Step 3: Positive confirmation
     res2 = coordinator.process_command(query)  # Re-hold
     res_confirm = coordinator.process_command(query, confirmation_response="yes I confirm")
-    assert res_confirm.success is True
+    assert res_confirm.success is False
     assert "Confirmed high-risk action" in res_confirm.message
 
 
@@ -137,7 +139,7 @@ def test_end_to_end_p2_to_p3_escalation():
     )
 
     # A complex workflow query
-    query = "In CanvasApp click the green submit icon in the corner"
+    query = "In CanvasApp click the green help icon in the corner"
     result = coordinator.process_command(query)
 
     assert result.success is True

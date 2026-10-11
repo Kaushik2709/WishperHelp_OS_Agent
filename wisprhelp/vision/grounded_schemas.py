@@ -99,7 +99,7 @@ class GroundedDecision:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> GroundedDecision:
         """Parses model response JSON safely into a typed GroundedDecision."""
-        action = str(data.get("action_type") or data.get("action") or data.get("type") or "finish").lower()
+        action = str(data.get("action_type") or data.get("action") or data.get("type") or "abort").lower()
         
         # Normalize action name
         if "click" in action and "double" not in action and "right" not in action:
@@ -117,7 +117,7 @@ class GroundedDecision:
         elif "abort" in action or "error" in action:
             action = ActionType.ABORT.value
 
-        cid = data.get("chosen_candidate_id") or data.get("candidate_id") or data.get("id")
+        cid = next((data[key] for key in ("chosen_candidate_id", "candidate_id", "id") if data.get(key) is not None), None)
         if cid is not None:
             try:
                 cid = int(cid)
@@ -128,7 +128,7 @@ class GroundedDecision:
         key = data.get("key") or data.get("key_combination")
         expected = data.get("expected_mutation") or data.get("expected_outcome") or ""
         thought = data.get("thought") or data.get("reasoning") or ""
-        conf = float(data.get("confidence", 1.0))
+        conf = float(data.get("confidence", 0.0))
 
         return cls(
             thought=thought,

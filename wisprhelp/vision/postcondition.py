@@ -60,30 +60,23 @@ class PostconditionVerifier:
             )
 
         # 3. Check for Active Window Title Change
-        title_changed = False
-        if os_adapter:
-            try:
-                active_win = os_adapter.get_active_window()
-                # If window title changed, high-confidence mutation occurred
-                if active_win and active_win.title:
-                    title_changed = True
-            except Exception:
-                pass
+        # A nonempty current title is not evidence that anything changed.
 
         # 4. Action-specific verification rules
         if action_type == ActionType.TYPE_TEXT.value:
-            # Text entry should either mutate the screen or be accepted by active control
-            if dist >= self.min_mutation_dhash or title_changed:
+            content = os_adapter.read_focused_text() if os_adapter else None
+            matched = isinstance(content, str) and bool(typed_text) and typed_text in content
+            if matched:
                 return PostconditionResult(
                     verified=True,
-                    details=f"Text injection verified. Screen mutated (dHash diff: {dist}).",
+                    details="Requested text observed in focused accessibility control.",
                     dhash_distance=dist,
                     text_matched=True,
                 )
             # If dHash didn't change, wait 0.1s and verify
             return PostconditionResult(
                 verified=False,
-                details=f"Text injection failed: No visual response or cursor advance detected on screen (dHash diff: {dist}).",
+                details=f"Text content unverified. No visual response proves exact text (dHash diff: {dist}).",
                 dhash_distance=dist,
                 text_matched=False,
             )
@@ -104,15 +97,15 @@ class PostconditionVerifier:
             )
 
         if action_type == ActionType.PRESS_KEY.value:
-            if dist >= self.min_mutation_dhash or title_changed:
+            if dist >= self.min_mutation_dhash:
                 return PostconditionResult(
                     verified=True,
                     details=f"Keypress '{key}' produced visual response (dHash diff: {dist}).",
                     dhash_distance=dist,
                 )
             return PostconditionResult(
-                verified=True,
-                details=f"Keypress '{key}' dispatched.",
+                verified=False,
+                details=f"Keypress '{key}' dispatched; postcondition unverified.",
                 dhash_distance=dist,
             )
 

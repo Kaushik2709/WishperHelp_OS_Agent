@@ -7,6 +7,7 @@ thresholds to select the optimal execution path.
 from __future__ import annotations
 
 import logging
+import math
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -35,8 +36,8 @@ class CommandRouter:
         confidence_threshold: Optional[float] = None,
         destructive_threshold: Optional[float] = None,
     ) -> None:
-        self.confidence_threshold = confidence_threshold or config.intent_confidence_threshold
-        self.destructive_threshold = destructive_threshold or config.destructive_risk_threshold
+        self.confidence_threshold = config.intent_confidence_threshold if confidence_threshold is None else confidence_threshold
+        self.destructive_threshold = config.destructive_risk_threshold if destructive_threshold is None else destructive_threshold
 
     def route(self, decision: JevDecision) -> Tuple[RouteTarget, str]:
         """Evaluates Jev decision and returns the optimal execution route and rationale.
@@ -48,6 +49,13 @@ class CommandRouter:
             Tuple of (RouteTarget, explanation_string).
         """
         # 1. Destructive Risk Interlock (Safety takes absolute precedence)
+        metrics = (decision.intent_confidence, decision.target_app_confidence,
+                   decision.complexity_confidence, decision.destructive_probability,
+                   decision.multilingual_probability)
+        if any(not math.isfinite(v) or not 0 <= v <= 1 for v in metrics):
+            return RouteTarget.CLARIFY, "Invalid classification metrics; execution blocked."
+        if not math.isfinite(decision.complexity_score) or not 0 <= decision.complexity_score <= 2:
+            return RouteTarget.CLARIFY, "Invalid classification complexity; execution blocked."
         if decision.is_high_risk(self.destructive_threshold):
             reason = (
                 f"Destructive risk score ({decision.destructive_probability:.2f} >= {self.destructive_threshold:.2f}). "

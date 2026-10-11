@@ -67,11 +67,20 @@ def print_banner() -> None:
    Universal Autonomous Computer-Using Agent (CUA)
 ===================================================================
 """
+    from wisprhelp.core.paths import paths
+    from wisprhelp.state.profiler import hardware_profiler
+
+    profile = hardware_profiler.get_profile()
+
     print(banner)
-    print(f" OS Platform       : {platform.system()} ({platform.release()})")
-    print(f" TypeSafe Jev Key  : {'Configured (Active)' if config.jev_api_key else 'Missing (Offline heuristic)'}")
-    print(f" Groq Whisper Key  : {'Configured' if config.groq_api_key else 'Missing (Mock mode)'}")
-    print(f" Vision VLM Key    : {'Configured' if (config.anthropic_api_key or config.gemini_api_key) else 'Missing (Offline sim)'}")
+    print(f" USB Root          : {paths.usb_root}")
+    print(f" Host Machine Hash : {profile.machine_hash} ({platform.system()} {platform.release()})")
+    print(f" Host RAM          : {profile.total_ram_gb:.1f} GB total ({profile.available_ram_gb:.1f} GB available)")
+    print(f" CPU / Threads     : {profile.cpu_cores} Cores / {profile.cpu_threads} Threads (Inference: {profile.optimal_threads})")
+    print(f" GPU Accelerator   : {profile.gpu_name or 'None (CPU RAM)'} ({'DirectML/CUDA offload' if profile.supports_gpu_offload else 'Optimized AVX2 CPU threads'})")
+    print(f" Cloud Reasoning   : Groq {config.groq_planner_model} ({'Configured' if config.groq_api_key else 'Missing'})")
+    print(f" Cloud Vision      : Gemini {config.gemini_model} ({'Configured' if config.gemini_api_key else 'Missing'})")
+    print(f" TypeSafe Jev (S1) : {'Configured (Active)' if config.jev_api_key else 'Missing (Offline heuristic)'}")
     print(f" Hotkey Trigger    : Ctrl + Shift (Push-to-Talk)")
     print(f" Emergency Abort   : Esc or Pause/Break")
     print("===================================================================\n")
@@ -99,6 +108,19 @@ def build_runtime(enable_gui: bool = True, enable_sound: bool = True) -> tuple[R
     return coordinator, hud, feedback, vlm_agent
 
 
+def _route_label(res) -> str:
+    """Derives a route label from an AgentTurnResult for console display."""
+    if getattr(res, "needs_confirmation", False):
+        return "SAFETY_INTERLOCK"
+    actions = getattr(res, "actions_executed", None) or []
+    types = {a.type.value if hasattr(a.type, "value") else str(a.type) for a in actions}
+    if not types or types <= {"respond", "wait"}:
+        return "CONVERSATIONAL_QUERY"
+    if types == {"type_text"}:
+        return "TEXT_INJECTION"
+    return "DYNAMIC_WORKFLOW"
+
+
 def run_interactive_cli(coordinator: RuntimeCoordinator, hud: StatusOverlayHUD) -> None:
     """Runs interactive command line prompt loop."""
     print("Type a command (or 'exit' to quit). For safety confirmations, answer 'yes' or 'no'.\n")
@@ -113,15 +135,17 @@ def run_interactive_cli(coordinator: RuntimeCoordinator, hud: StatusOverlayHUD) 
                 print("Exiting WisprHelp. Goodbye!")
                 break
 
-            # Process command
-            res = coordinator.process_command(user_input)
-            print(f"[{res.route.value.upper()}] ({res.latency_ms:.1f}ms): {res.message}")
+            # Process command via the LLM-first dynamic semantic pipeline
+            res = coordinator.process_turn_semantic(user_input)
+            print(f"[{_route_label(res)}] ({res.latency_ms:.1f}ms): {res.message}")
 
             # If held at safety gate, prompt user immediately
-            if res.route.value == "safety_interlock" and coordinator.safety_gate.has_pending():
+            for _ in range(15):
+                if not res.needs_confirmation:
+                    break
                 confirm = input("\nConfirm high-risk action? [yes/no]: ").strip()
-                confirm_res = coordinator.process_command(user_input, confirmation_response=confirm)
-                print(f"[{confirm_res.route.value.upper()}]: {confirm_res.message}")
+                res = coordinator.process_turn_semantic(user_input, confirmation_response=confirm)
+                print(f"[SAFETY_INTERLOCK]: {res.message}")
 
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down...")
@@ -157,7 +181,7 @@ def main() -> None:
     # Emergency kill-switch abort callback
     def on_emergency_abort():
         logger.critical("EMERGENCY ABORT HOOK TRIGGERED!")
-        vlm_agent.abort()
+        coordinator.cancel(emergency=True)
         hud.set_state(HUDState.ERROR, "EMERGENCY ABORT")
         feedback.play_abort()
         tts.speak_async("Execution aborted.")
@@ -201,11 +225,18 @@ def main() -> None:
     # 1. Single Command Mode
     if args.text:
         hud.start()
-        res = coordinator.process_command(args.text)
-        print(f"\nResult [{res.route.value}]: {res.message} (Latency: {res.latency_ms:.1f}ms)")
+        res = coordinator.process_turn_semantic(args.text)
+        print(f"\nResult [{_route_label(res)}]: {res.message} (Latency: {res.latency_ms:.1f}ms)")
+        if sys.stdin.isatty():
+            for _ in range(15):
+                if not res.needs_confirmation:
+                    break
+                confirmation = input("Confirm high-risk action? [yes/no]: ").strip()
+                res = coordinator.process_turn_semantic(args.text, confirmation_response=confirmation)
+                print(f"Result [{_route_label(res)}]: {res.message}")
         hud.stop()
         hotkey_listener.stop()
-        sys.exit(0)
+        sys.exit(0 if res.success and not res.needs_confirmation else 1)
 
     # 2. Voice Mode
     if args.voice:
@@ -226,36 +257,40 @@ def main() -> None:
         def on_speech(audio_data: bytes):
             # Guard against overlapping triggers while an action is executing
             if not execution_lock.acquire(blocking=False):
-                logger.warning("Another voice action is actively running. Ignoring overlapping utterance.")
+                # A stop request must not disappear behind the execution lock.
+                transcript = stt.transcribe(audio_data)
+                if coordinator.agent.reasoner._is_interruption(transcript.lower().strip()):
+                    coordinator.cancel()
+                else:
+                    logger.warning("Another voice action is running; overlapping task ignored.")
                 return
 
             try:
                 hud.set_state(HUDState.THINKING, "Transcribing speech...")
-                transcript = stt.transcribe(audio_data)
+                transcription = stt.transcribe_result(audio_data)
+                transcript = transcription.text
+                if transcription.failure_code.value != "none":
+                    hud.set_state(HUDState.ERROR, "Speech transcription unavailable")
+                    print("[Voice]: Speech transcription unavailable. No action was queued.")
+                    return
                 if not transcript or not transcript.strip():
-                    hud.set_state(HUDState.LISTENING, "Listening for voice...")
+                    logger.warning(
+                        "Transcription returned no usable text. "
+                        "Possible causes: mic muted/too quiet, wrong default input device, or STT quota."
+                    )
+                    print("\n[Voice]: No speech detected. Check your microphone is the default input device and is not muted.")
+                    hud.set_state(HUDState.LISTENING, "No speech detected - check mic")
                     return
                 print(f"\n[Voice Heard]: '{transcript}'")
-                res = coordinator.process_command(transcript)
-                print(f"[{res.route.value.upper()}] ({res.latency_ms:.1f}ms): {res.message}")
-                if res.route.value == "conversational_query":
-                    tts.speak_async(res.message)
-                elif res.route.value == "safety_interlock":
+                res = coordinator.process_turn_semantic(transcript)
+                route = _route_label(res)
+                print(f"[{route}] ({res.latency_ms:.1f}ms): {res.message}")
+                if route == "SAFETY_INTERLOCK":
                     tts.speak_async("High risk action detected. Please confirm with yes or no.")
+                elif route == "CONVERSATIONAL_QUERY":
+                    tts.speak_async(res.message)
                 elif res.success:
-                    if "Composed and typed text" in res.message:
-                        tts.speak_async("I've written that into your active document.")
-                    elif "Searched for" in res.message:
-                        tts.speak_async("Searching the web for you.")
-                    elif "Navigated to" in res.message:
-                        tts.speak_async("Opening website.")
-                    elif "Opened new browser tab" in res.message:
-                        tts.speak_async("New tab opened.")
-                    elif "Closed current browser tab" in res.message:
-                        tts.speak_async("Tab closed.")
-                    elif "Launched application" in res.message:
-                        app_name = res.message.split("'")[1] if "'" in res.message else "app"
-                        tts.speak_async(f"Opening {app_name}.")
+                    tts.speak_async("Done.")
                 elif not res.success:
                     tts.speak_async("Could not complete action.")
             except Exception as exc:

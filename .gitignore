@@ -20,6 +20,8 @@ venv.bak/
 
 # Testing & Linting
 .pytest_cache/
+.test-tmp/
+evaluation-results/
 .mypy_cache/
 .ruff_cache/
 .coverage

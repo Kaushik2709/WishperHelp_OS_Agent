@@ -21,9 +21,20 @@ class ActionType(str, Enum):
     TYPE_TEXT = "type_text"
     PRESS_KEY = "press_key"
     KEY_COMBINATION = "key_combination"
+    SELECT_ALL = "select_all"
+    CLEAR_TEXT = "clear_text"
     SCROLL = "scroll"
+    DRAG = "drag"
     SELECT = "select"
     OPEN_FILE = "open_file"
+    CREATE_FILE = "create_file"
+    WRITE_FILE = "write_file"
+    APPEND_FILE = "append_file"
+    RENAME_FILE = "rename_file"
+    MOVE_FILE = "move_file"
+    DELETE_FILE = "delete_file"
+    READ_FILE = "read_file"
+    OPEN_FOLDER = "open_folder"
     FIND_FILE = "find_file"
     SEARCH = "search"
     NAVIGATE = "navigate"
@@ -32,6 +43,14 @@ class ActionType(str, Enum):
     ASK_CLARIFICATION = "ask_clarification"
     RESPOND = "respond"
     MEDIA_CONTROL = "media_control"
+
+
+# Conditions that can be evaluated at runtime before executing a step.
+SUPPORTED_CONDITIONS = (
+    "document_has_content",
+    "document_is_empty",
+    "clipboard_non_empty",
+)
 
 
 @dataclass
@@ -47,6 +66,7 @@ class Action:
     grounding_tier: Optional[int] = None  # 1 (Shell/P1), 2 (UIA/P2), 3 (Vision/P3)
     rationale: str = ""
     resolved_target: Optional[Any] = None
+    condition: Optional[str] = None  # Runtime predicate; step is skipped when false
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes action to a clean dictionary."""
@@ -59,6 +79,7 @@ class Action:
             "is_destructive": self.is_destructive,
             "grounding_tier": self.grounding_tier,
             "rationale": self.rationale,
+            "condition": self.condition,
         }
 
     @classmethod
@@ -79,6 +100,7 @@ class Action:
             is_destructive=bool(data.get("is_destructive", False)),
             grounding_tier=data.get("grounding_tier"),
             rationale=data.get("rationale", ""),
+            condition=data.get("condition"),
         )
 
     # --- Convenience Factory Constructors ---
@@ -111,6 +133,7 @@ class Action:
         button: str = "left",
         clicks: int = 1,
         rationale: str = "",
+        condition: Optional[str] = None,
     ) -> Action:
         act_type = ActionType.DOUBLE_CLICK if clicks == 2 else (ActionType.RIGHT_CLICK if button == "right" else ActionType.CLICK)
         return cls(
@@ -118,6 +141,7 @@ class Action:
             target=target,
             params={"button": button, "clicks": clicks},
             rationale=rationale or f"Click target '{target}'",
+            condition=condition,
         )
 
     @classmethod
@@ -148,6 +172,42 @@ class Action:
             params={"keys": keys},
             grounding_tier=1,
             rationale=rationale or f"Press hotkey combination '{'+'.join(keys)}'",
+        )
+
+    @classmethod
+    def select_all(cls, target: str = "active_document", rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.SELECT_ALL,
+            target=target,
+            grounding_tier=1,
+            rationale=rationale or "Select all content in the active document",
+        )
+
+    @classmethod
+    def clear_text(cls, target: str = "active_document", rationale: str = "", condition: Optional[str] = None) -> Action:
+        return cls(
+            type=ActionType.CLEAR_TEXT,
+            is_destructive=True,
+            target=target,
+            grounding_tier=1,
+            rationale=rationale or "Clear all content from the active document",
+            condition=condition,
+        )
+
+    @classmethod
+    def drag(
+        cls,
+        source: str,
+        destination: str,
+        rationale: str = "",
+        condition: Optional[str] = None,
+    ) -> Action:
+        return cls(
+            type=ActionType.DRAG,
+            target=source,
+            payload=destination,
+            rationale=rationale or f"Drag '{source}' to '{destination}'",
+            condition=condition,
         )
 
     @classmethod
@@ -255,4 +315,82 @@ class Action:
             payload=command,
             grounding_tier=1,
             rationale=rationale or f"Media control '{command}'",
+        )
+
+    @classmethod
+    def create_file(cls, path: str, content: str = "", rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.CREATE_FILE,
+            target=path,
+            payload=content,
+            grounding_tier=1,
+            rationale=rationale or f"Create file '{path}' natively",
+        )
+
+    @classmethod
+    def write_file(cls, path: str, content: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.WRITE_FILE,
+            target=path,
+            payload=content,
+            grounding_tier=1,
+            rationale=rationale or f"Write to file '{path}' natively",
+        )
+
+    @classmethod
+    def append_file(cls, path: str, content: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.APPEND_FILE,
+            target=path,
+            payload=content,
+            grounding_tier=1,
+            rationale=rationale or f"Append to file '{path}' natively",
+        )
+
+    @classmethod
+    def rename_file(cls, old_path: str, new_name: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.RENAME_FILE,
+            target=old_path,
+            payload=new_name,
+            grounding_tier=1,
+            rationale=rationale or f"Rename '{old_path}' to '{new_name}'",
+        )
+
+    @classmethod
+    def move_file(cls, source_path: str, destination_dir: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.MOVE_FILE,
+            target=source_path,
+            payload=destination_dir,
+            grounding_tier=1,
+            rationale=rationale or f"Move '{source_path}' to '{destination_dir}'",
+        )
+
+    @classmethod
+    def delete_file(cls, path: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.DELETE_FILE,
+            target=path,
+            grounding_tier=1,
+            is_destructive=True,  # Safety interlock gate required
+            rationale=rationale or f"Delete file '{path}' natively",
+        )
+
+    @classmethod
+    def read_file(cls, path: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.READ_FILE,
+            target=path,
+            grounding_tier=1,
+            rationale=rationale or f"Read file '{path}' natively",
+        )
+
+    @classmethod
+    def open_folder(cls, path: str, rationale: str = "") -> Action:
+        return cls(
+            type=ActionType.OPEN_FOLDER,
+            target=path,
+            grounding_tier=1,
+            rationale=rationale or f"Open folder '{path}'",
         )

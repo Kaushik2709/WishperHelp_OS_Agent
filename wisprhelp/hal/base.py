@@ -130,7 +130,9 @@ class BaseOSAdapter(ABC):
             import pyautogui
             clicks = -amount if direction == "down" else amount
             pyautogui.scroll(clicks * 100)
-        except Exception:
+        except Exception as exc:
+            if type(exc).__name__ in ("FailSafeException", "EmergencyKillSwitchTriggered"):
+                raise
             self.press_key("pagedown" if direction == "down" else "pageup")
 
     def get_open_windows(self) -> List[WindowInfo]:
@@ -149,6 +151,22 @@ class BaseOSAdapter(ABC):
             return pyperclip.paste() or ""
         except Exception:
             return ""
+
+    def set_clipboard_text(self, text: str) -> bool:
+        """Places Unicode string text into the OS clipboard.
+
+        Args:
+            text: The text to place on the clipboard.
+
+        Returns:
+            True if the clipboard was set successfully.
+        """
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            return True
+        except Exception:
+            return False
 
     def open_file(self, file_path: str) -> bool:
         """Opens a local file using the default OS application."""
@@ -171,13 +189,50 @@ class BaseOSAdapter(ABC):
         """Returns interactive UI controls (buttons, tabs, inputs) visible in the foreground."""
         return []
 
+    def focus_text_input(self, field: Optional[str] = None) -> bool:
+        """Focus an unambiguous editable control in the foreground window."""
+        candidates = [e for e in self.get_visible_elements()
+                      if any(t in e.get("control_type", "").lower() for t in ("edit", "document"))
+                      and e.get("center")]
+        if field and field.lower() not in ("editor", "active_document", "current", "active"):
+            candidates = [e for e in candidates if field.casefold() in
+                          f"{e.get('name', '')} {e.get('auto_id', '')}".casefold()]
+        if len(candidates) != 1:
+            return False
+        self.click(*candidates[0]["center"])
+        return True
+
+    def read_focused_text(self) -> Optional[str]:
+        """Read editable content via accessibility; None means unknown, not empty."""
+        return None
+
+    def check_emergency_stop(self) -> None:
+        """Platform hook raising the native emergency-stop exception, if active."""
+        import pyautogui
+        pyautogui.failSafeCheck()
+
+    def has_unexpected_modal(self) -> Optional[bool]:
+        """True if foreground is a blocking dialog; None if unsupported."""
+        return None
+
+    def move_text_caret_to_end(self) -> None:
+        import platform
+        self.key_combination(["command", "down"] if platform.system() == "Darwin" else ["ctrl", "end"])
+
 
     def wait_for_active_window(self, target_keywords: List[str], timeout: float = 2.0) -> bool:
         """Polls until the foreground window title or process contains one of target_keywords."""
         import time
         start = time.perf_counter()
         targets = [k.lower().strip() for k in target_keywords if k and k.strip()]
+        aliases = {
+            "browser": ("chrome", "firefox", "edge", "safari", "brave"),
+            "file_manager": ("explorer", "finder", "nautilus", "dolphin"),
+            "file explorer": ("explorer",), "vscode": ("code",), "vs code": ("code",),
+        }
+        targets += [alias for target in list(targets) for alias in aliases.get(target, ())]
         while time.perf_counter() - start < timeout:
+            self.check_emergency_stop()
             win = self.get_active_window()
             title_lower = win.title.lower()
             proc_lower = win.process_name.lower()

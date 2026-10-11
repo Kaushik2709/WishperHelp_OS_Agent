@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import platform
 import re
+import math
 from typing import Any, Dict, Optional
 
 from wisprhelp.classification.client import JevClient
@@ -90,6 +91,7 @@ class JevClassifier:
         except Exception as exc:
             logger.error("TypeSafe JEV API evaluation failed: %s. Using local fallback.", exc)
             decision = self._offline_fallback_classify(cleaned_query, context, decomposed)
+            decision.raw_response["degraded_reason"] = "api_unavailable"
 
         return decision
 
@@ -99,7 +101,31 @@ class JevClassifier:
         decomposed: Optional[DecomposedQuery] = None,
     ) -> JevDecision:
         """Parses raw JEV response into typed JevDecision dataclass with calibrated confidence."""
-        answers = raw.get("answers", {})
+        answers = raw.get("answers", {}) if isinstance(raw, dict) else {}
+        def score(section, key, upper=1.0):
+            value = answers.get(section, {}).get(key)
+            if isinstance(value, bool):
+                raise ValueError("Boolean classification score")
+            result = float(value)
+            if not math.isfinite(result) or not 0 <= result <= upper:
+                raise ValueError("Invalid classification score")
+            return result
+
+        # Incomplete/malformed API responses must not acquire confident defaults.
+        try:
+            score("intent", "confidence")
+            score("target_app", "confidence")
+            score("complexity", "score", 2)
+            score("complexity", "confidence")
+            score("is_destructive", "noul")
+            score("has_multilingual_content", "noul")
+            if answers["intent"].get("choice") not in {i.value for i in IntentType}:
+                raise ValueError("Unknown intent")
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return JevDecision(IntentType.GUI_WORKFLOW_AUTOMATION.value, 0.0,
+                               TargetApp.GENERIC_OR_ACTIVE.value, 0.0, 2.0, 0.0,
+                               False, 0.0, False, 0.0,
+                               raw_response={"invalid_classification": True}, decomposed_plan=decomposed)
 
         # 1. Intent (Choice)
         intent_data = answers.get("intent", {})
@@ -130,13 +156,12 @@ class JevClassifier:
         if decomposed:
             if decomposed.is_compound:
                 intent = IntentType.GUI_WORKFLOW_AUTOMATION.value
-                intent_conf = max(intent_conf, 0.95)
+                # Decomposition can change the route, never increase calibration.
                 comp_score = max(comp_score, 2.0)
             if decomposed.target_app and target_app == TargetApp.GENERIC_OR_ACTIVE.value:
                 mapped = self._map_app_to_target_enum(decomposed.target_app)
                 if mapped != TargetApp.GENERIC_OR_ACTIVE.value:
                     target_app = mapped
-                    app_conf = max(app_conf, 0.92)
 
         return JevDecision(
             intent=intent,
@@ -191,6 +216,7 @@ class JevClassifier:
         destructive_keywords = [
             "delete", "remove", "erase", "format", "wipe", "drop",
             "kill", "terminate", "uninstall", "destroy", "shutdown",
+            "send", "submit", "pay", "purchase", "buy", "overwrite",
         ]
         is_destructive = any(kw in lower_query for kw in destructive_keywords)
         dest_prob = 0.95 if is_destructive else 0.05
@@ -225,6 +251,7 @@ class JevClassifier:
         if (
             (decomposed and decomposed.normalized_intent == IntentType.CONVERSATIONAL_QUERY.value)
             or any(w in lower_query for w in conversational_triggers)
+            or bool(re.match(r"tell me (?:a |an )?.*joke", lower_query))
             or (bool(q_words & single_words) and len(q_words) <= 2)
         ):
             return JevDecision(
@@ -255,8 +282,8 @@ class JevClassifier:
                 target_app_confidence=0.85,
                 complexity_score=0.0,
                 complexity_confidence=0.90,
-                is_destructive=False,
-                destructive_probability=0.05,
+                is_destructive=is_destructive,
+                destructive_probability=dest_prob,
                 has_multilingual_content=has_non_ascii,
                 multilingual_probability=0.95 if has_non_ascii else 0.05,
                 raw_response={"fallback": True},
@@ -293,8 +320,9 @@ class JevClassifier:
             )
 
         # Typing patterns (strictly excluded if click/button terms present)
-        is_click = any(w in lower_query for w in ("click", "press", "tap", "select", "button", "btn", "tab", "chat", "icon"))
-        if not is_click and lower_query.startswith(("type ", "write ", "लिखो ", "टाइप करो ")):
+        is_click = bool(re.match(r"(?:please\s+)?(?:click|press|tap|select)\b", lower_query))
+        is_composition = bool(re.match(r"write\s+(?:something|an?\s+(?:email|essay|story|poem|paragraph)|about)\b", lower_query))
+        if not is_click and not is_composition and lower_query.startswith(("type ", "write ", "लिखो ", "टाइप करो ")):
             return JevDecision(
                 intent=IntentType.TEXT_INPUT_INJECTION.value,
                 intent_confidence=0.88,

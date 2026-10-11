@@ -12,6 +12,9 @@ import os
 import re
 import subprocess
 import time
+from itertools import islice
+import threading
+from functools import wraps
 from typing import Dict, List, Optional, Tuple
 
 import pyautogui
@@ -31,11 +34,23 @@ try:
     HAS_UIA = True
 except ImportError:
     HAS_UIA = False
+    auto = None
 
 from wisprhelp.config import config
 from wisprhelp.hal.base import BaseOSAdapter, WindowInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _uia_thread(method):
+    """Initialize COM for voice-worker UIA calls as required by uiautomation."""
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        if HAS_UIA and threading.current_thread() is not threading.main_thread():
+            with auto.UIAutomationInitializerInThread():
+                return method(*args, **kwargs)
+        return method(*args, **kwargs)
+    return wrapped
 
 # Virtual Key Codes for Media
 VK_VOLUME_MUTE = 0xAD
@@ -78,7 +93,7 @@ class WindowsOSAdapter(BaseOSAdapter):
 
     def __init__(self) -> None:
         # Enable PyAutoGUI fail-safe (fling mouse to screen corner to abort)
-        pyautogui.FAILSAFE = config.kill_switch_enabled
+        pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.05
         self._start_apps_cache: Dict[str, str] = {}
         self._app_paths_cache: Dict[str, str] = {}
@@ -322,7 +337,7 @@ class WindowsOSAdapter(BaseOSAdapter):
             import shutil
             found_which = shutil.which(target) or shutil.which(f"{target}.exe")
             if found_which:
-                subprocess.Popen([found_which])
+                subprocess.Popen([found_which] + ([parameter] if parameter else []))
                 logger.info("Layer 4: Launched executable from PATH: %s", found_which)
                 return True
             os.startfile(target)
@@ -332,7 +347,9 @@ class WindowsOSAdapter(BaseOSAdapter):
             pass
 
         # --- Layer 5: Universal Human-Like Windows Start Search Fallback (< 450ms) ---
-        return self._launch_via_start_search(target)
+        # A failed native launch must not type an unknown name into Start/Search
+        # and press Enter in whichever UI happens to own focus.
+        return False
 
     def get_active_window(self) -> WindowInfo:
         """Returns information about the foreground window."""
@@ -398,20 +415,17 @@ class WindowsOSAdapter(BaseOSAdapter):
         try:
             pyperclip.copy(text)
             time.sleep(0.04)  # Ensure clipboard buffer update
+            self.check_emergency_stop()
             if HAS_WIN32:
                 # Use native Win32 keyboard events for instantaneous paste
-                VK_CONTROL = 0x11
-                VK_V = 0x56
-                win32api.keybd_event(VK_CONTROL, 0, 0, 0)
-                win32api.keybd_event(VK_V, 0, 0, 0)
-                time.sleep(0.02)
-                win32api.keybd_event(VK_V, 0, win32con.KEYEVENTF_KEYUP, 0)
-                win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+                self._send_native_keys([0x11, 0x56])
             else:
                 pyautogui.hotkey("ctrl", "v")
             time.sleep(0.04)
             return True
         except Exception as exc:
+            if type(exc).__name__ in ("FailSafeException", "EmergencyKillSwitchTriggered"):
+                raise
             logger.error("Failed to inject unicode text via clipboard: %s", exc)
             return False
         finally:
@@ -442,7 +456,10 @@ class WindowsOSAdapter(BaseOSAdapter):
                     logger.info("Set Windows master volume to %d%% via pycaw.", pct)
                     return True
                 except Exception as pycaw_exc:
-                    logger.warning("pycaw volume adjustment failed: %s; trying key fallback.", pycaw_exc)
+                    logger.warning("pycaw volume adjustment failed (%s); using keybd event fallback.", pycaw_exc)
+                    win32api.keybd_event(VK_VOLUME_UP, 0, 0, 0)
+                    win32api.keybd_event(VK_VOLUME_UP, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    return True
             except Exception as exc:
                 logger.error("Error parsing volume target: %s", exc)
                 return False
@@ -496,6 +513,7 @@ class WindowsOSAdapter(BaseOSAdapter):
             logger.error("Error dispatching media key %s: %s", cmd, exc)
             return False
 
+    @_uia_thread
     def find_ordinal_element(
         self, ordinal_index: int, item_type: str = "item", target_app: Optional[str] = None
     ) -> Optional[Tuple[int, int]]:
@@ -528,6 +546,16 @@ class WindowsOSAdapter(BaseOSAdapter):
                                 win_ctrl.SetFocus()
                             except Exception:
                                 pass
+                            if HAS_WIN32 and getattr(win_ctrl, "NativeWindowHandle", None):
+                                try:
+                                    hwnd = win_ctrl.NativeWindowHandle
+                                    if hwnd and win32gui.IsIconic(hwnd):
+                                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                                    if hwnd:
+                                        win32gui.SetForegroundWindow(hwnd)
+                                        time.sleep(0.12)
+                                except Exception:
+                                    pass
                             break
                 except Exception:
                     pass
@@ -546,21 +574,55 @@ class WindowsOSAdapter(BaseOSAdapter):
 
             candidates: List[auto.Control] = []
             item_type_lower = (item_type or "item").lower()
+            win_r = root.BoundingRectangle if root else None
+            is_whatsapp = (target_app and "whatsapp" in target_app.lower()) or (root and "whatsapp" in (root.Name or "").lower())
+            is_explorer = (target_app and "explorer" in target_app.lower()) or (root and any(k in (root.Name or "").lower() for k in ("explorer", "documents", "downloads", "desktop", "files", "folder")))
 
             def _collect_items(ctrl: auto.Control, depth: int) -> bool:
                 ctrl_type = (ctrl.ControlTypeName or "").lower()
                 rect = ctrl.BoundingRectangle
                 w, h = rect.width(), rect.height()
 
-                # Basic sanity check: visible on screen (allow negative coordinates up to -30 for maximized windows on Windows 10/11)
+                # Basic sanity check: visible on screen
                 if w <= 10 or h <= 10 or rect.top < -30 or rect.left < -30:
                     return False
 
-                # Chat / List item matching
-                if item_type_lower in ("chat", "conversation", "contact", "item", "row", "message"):
+                name_lower = (ctrl.Name or "").lower()
+                auto_id_lower = (ctrl.AutomationId or "").lower()
+
+                # 1. Chat / Conversation / Contact matching (e.g. WhatsApp, Teams, Slack)
+                if item_type_lower in ("chat", "conversation", "contact", "set", "message"):
+                    # Strictly exclude search bar, filter tabs, edit controls, settings, status
+                    if any(k in name_lower or k in auto_id_lower for k in ("search", "filter", "status", "community", "new chat", "attach", "settings", "profile", "camera")):
+                        return False
+                    if "edit" in ctrl_type or "tabitem" in ctrl_type:
+                        return False
+                    # WhatsApp Desktop specific geometric constraints
+                    if is_whatsapp and win_r:
+                        # Chat rows are strictly below the search bar and filter pills (y >= win_top + 115)
+                        if rect.top < win_r.top + 115:
+                            return False
+                        # Chat rows are strictly in conversation pane, past left sidebar strip (48px)
+                        if rect.left < win_r.left + 48:
+                            return False
+                        # Chat rows are in the left conversation pane (x <= win_left + 42% width)
+                        if rect.left > win_r.left + int(win_r.width() * 0.42):
+                            return False
+
                     if any(t in ctrl_type for t in ("listitem", "custom", "dataitem", "pane", "button", "group")):
-                        if w >= 60 and 20 <= h <= 250:
+                        if w >= 60 and 30 <= h <= 160:
                             candidates.append(ctrl)
+
+                # 2. File / Document / Folder matching (e.g. File Explorer)
+                elif item_type_lower in ("file", "document", "folder"):
+                    if win_r and is_explorer:
+                        # Exclude navigation pane on left and command toolbar at top
+                        if rect.left < win_r.left + 180 or rect.top < win_r.top + 100:
+                            return False
+                    if any(t in ctrl_type for t in ("listitem", "dataitem", "custom")):
+                        if w >= 40 and 18 <= h <= 250:
+                            candidates.append(ctrl)
+
                 elif item_type_lower in ("tab", "tabitem"):
                     if "tabitem" in ctrl_type or ("button" in ctrl_type and h <= 50):
                         candidates.append(ctrl)
@@ -573,18 +635,17 @@ class WindowsOSAdapter(BaseOSAdapter):
                             candidates.append(ctrl)
                 return False
 
-            auto.WalkControl(root, _collect_items, maxDepth=12)
+            for ctrl, depth in islice(auto.WalkControl(root, maxDepth=12), 500):
+                if _collect_items(ctrl, depth):
+                    break
 
             # If candidates are empty and target is WhatsApp chat list:
-            # WhatsApp Desktop chat list is in the left 20-30% pane, below the header/search bar
-            if not candidates and (
-                (target_app and "whatsapp" in target_app.lower())
-                or (root and "whatsapp" in (root.Name or "").lower())
-            ) and item_type_lower in ("chat", "conversation", "contact", "item", "row"):
-                win_r = root.BoundingRectangle
-                if win_r.width() > 200 and win_r.height() > 200:
-                    chat_x = win_r.left + min(220, max(80, int(win_r.width() * 0.22)))
-                    row_offset = 140 + max(0, ordinal_index) * 72
+            # WhatsApp Desktop chat list is in the left 20-30% pane, strictly below the search bar
+            if not candidates and is_whatsapp and item_type_lower in ("chat", "conversation", "contact", "set", "item", "row"):
+                if win_r and win_r.width() > 200 and win_r.height() > 200:
+                    chat_x = win_r.left + min(220, max(120, int(win_r.width() * 0.22)))
+                    # First chat row vertical center is at ~210px offset from top (safely centered in the conversation row, past search bar & filter pills)
+                    row_offset = 210 + max(0, ordinal_index) * 72
                     chat_y = win_r.top + row_offset
                     logger.info("Using WhatsApp desktop layout coordinate fallback for ordinal [%d] chat: (%d, %d)", ordinal_index, chat_x, chat_y)
                     return (chat_x, chat_y)
@@ -637,6 +698,7 @@ class WindowsOSAdapter(BaseOSAdapter):
 
         return None
 
+    @_uia_thread
     def find_accessibility_element(
         self, query: str, control_type: Optional[str] = None
     ) -> Optional[Tuple[int, int]]:
@@ -675,6 +737,8 @@ class WindowsOSAdapter(BaseOSAdapter):
                 help_text = (ctrl.HelpText or "").strip().lower()
                 ctrl_type = (ctrl.ControlTypeName or "").lower()
 
+                if control_type and control_type.lower() not in ctrl_type:
+                    return False
                 is_match = False
                 is_btn = "button" in ctrl_type or "menuitem" in ctrl_type or "tabitem" in ctrl_type or "link" in ctrl_type
 
@@ -700,7 +764,9 @@ class WindowsOSAdapter(BaseOSAdapter):
                 return False
 
             # Search up to depth 16 for comprehensive coverage across Electron / IDEs
-            auto.WalkControl(root, _check_control, maxDepth=16)
+            for ctrl, depth in islice(auto.WalkControl(root, maxDepth=16), 500):
+                if _check_control(ctrl, depth):
+                    break
 
             all_candidates = exact_matches + button_matches + other_matches
             if all_candidates:
@@ -727,6 +793,7 @@ class WindowsOSAdapter(BaseOSAdapter):
             pyautogui.moveTo(x, y, duration=duration)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted mouse movement.")
+            raise
 
     def click(
         self,
@@ -740,57 +807,67 @@ class WindowsOSAdapter(BaseOSAdapter):
             pyautogui.click(x=x, y=y, button=button, clicks=clicks)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted click.")
+            raise
+
+    def _send_native_keys(self, vk_codes: List[int]) -> None:
+        """Release even partially dispatched chords; never replay an uncertain chord."""
+        pressed = []
+        try:
+            for vk in vk_codes:
+                self.check_emergency_stop()
+                pressed.append(vk)
+                win32api.keybd_event(vk, 0, 0, 0)
+            time.sleep(0.02)
+        finally:
+            release_error = None
+            for vk in reversed(pressed):
+                try:
+                    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+                except Exception as exc:
+                    release_error = exc
+            if release_error is not None:
+                raise release_error
 
     def key_combination(self, keys: List[str]) -> None:
         """Presses and releases keyboard hotkeys using native Win32 events if available."""
+        self.check_emergency_stop()
         if HAS_WIN32:
-            try:
-                vk_codes = []
-                for k in keys:
-                    kl = k.lower().strip()
-                    if kl in WIN32_VK_MAP:
-                        vk_codes.append(WIN32_VK_MAP[kl])
-                    elif len(kl) == 1:
-                        vk_codes.append(ord(kl.upper()))
-
-                # Press down in order
-                for vk in vk_codes:
-                    win32api.keybd_event(vk, 0, 0, 0)
-                time.sleep(0.02)
-                # Release in reverse order
-                for vk in reversed(vk_codes):
-                    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-                logger.info("Dispatched native Win32 hotkey combination: %s", keys)
+            vk_codes = []
+            for k in keys:
+                kl = k.lower().strip()
+                if kl in WIN32_VK_MAP:
+                    vk_codes.append(WIN32_VK_MAP[kl])
+                elif len(kl) == 1:
+                    vk_codes.append(ord(kl.upper()))
+                else:
+                    break
+            if len(vk_codes) == len(keys):
+                self._send_native_keys(vk_codes)
                 return
-            except Exception as exc:
-                logger.debug("Native keybd_event hotkey failed: %s; falling back to PyAutoGUI.", exc)
 
         try:
             pyautogui.hotkey(*keys)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted hotkey: %s", keys)
+            raise
 
     def press_key(self, key: str) -> None:
         """Presses and releases a single key using native Win32 events if available."""
+        self.check_emergency_stop()
         if HAS_WIN32:
-            try:
-                kl = key.lower().strip()
-                vk = WIN32_VK_MAP.get(kl)
-                if vk is None and len(kl) == 1:
-                    vk = ord(kl.upper())
-                if vk is not None:
-                    win32api.keybd_event(vk, 0, 0, 0)
-                    time.sleep(0.02)
-                    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-                    logger.info("Dispatched native Win32 key press: %s (0x%X)", key, vk)
-                    return
-            except Exception as exc:
-                logger.debug("Native keybd_event press_key failed: %s; falling back to PyAutoGUI.", exc)
+            kl = key.lower().strip()
+            vk = WIN32_VK_MAP.get(kl)
+            if vk is None and len(kl) == 1:
+                vk = ord(kl.upper())
+            if vk is not None:
+                self._send_native_keys([vk])
+                return
 
         try:
             pyautogui.press(key)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted key press: %s", key)
+            raise
 
     def scroll(self, direction: str = "down", amount: int = 3) -> None:
         """Scrolls up or down using native PyAutoGUI or Win32 mouse wheel event."""
@@ -799,6 +876,7 @@ class WindowsOSAdapter(BaseOSAdapter):
             pyautogui.scroll(clicks * 120)
         except pyautogui.FailSafeException:
             logger.warning("PyAutoGUI fail-safe intercepted scroll.")
+            raise
         except Exception:
             self.press_key("pagedown" if direction == "down" else "pageup")
 
@@ -890,6 +968,7 @@ class WindowsOSAdapter(BaseOSAdapter):
         except Exception:
             return ""
 
+    @_uia_thread
     def get_visible_elements(self, max_depth: int = 4) -> List[Dict[str, Any]]:
         """Extracts visible interactive controls in the foreground window via UI Automation."""
         if not HAS_UIA:
@@ -917,8 +996,8 @@ class WindowsOSAdapter(BaseOSAdapter):
                 if rect.width() > 10 and rect.height() > 10 and rect.top >= 0 and rect.left >= 0:
                     cx = rect.left + rect.width() // 2
                     cy = rect.top + rect.height() // 2
-                    if any(t in ctrl_type for t in ("button", "tabitem", "listitem", "edit", "menuitem", "checkbox", "hyperlink")):
-                        if name:
+                    if any(t in ctrl_type for t in ("button", "tabitem", "listitem", "edit", "document", "menuitem", "checkbox", "hyperlink")):
+                        if name or "edit" in ctrl_type or "document" in ctrl_type:
                             elements.append({
                                 "name": name,
                                 "control_type": ctrl_type,
@@ -927,9 +1006,87 @@ class WindowsOSAdapter(BaseOSAdapter):
                             })
                 return False
 
-            auto.WalkControl(root, _collect_elem, maxDepth=max_depth)
+            for ctrl, depth in islice(auto.WalkControl(root, maxDepth=max_depth), 500):
+                if _collect_elem(ctrl, depth):
+                    break
         except Exception as exc:
             logger.debug("get_visible_elements error: %s", exc)
 
         return elements
 
+
+    @staticmethod
+    def _editable_control(ctrl) -> bool:
+        if not ctrl or not any(t in (ctrl.ControlTypeName or "").lower() for t in ("edit", "document")):
+            return False
+        try:
+            if not ctrl.IsEnabled or ctrl.IsOffscreen:
+                return False
+            value = ctrl.GetValuePattern()
+            if value and value.IsReadOnly:
+                return False
+        except Exception:
+            pass
+        return True
+
+    @_uia_thread
+    def focus_text_input(self, field: Optional[str] = None) -> bool:
+        if not HAS_UIA:
+            return False
+        try:
+            root = auto.GetForegroundControl()
+            candidates = [ctrl for ctrl, _ in islice(auto.WalkControl(root, includeTop=True, maxDepth=12), 500)
+                          if self._editable_control(ctrl)]
+            generic = not field or field.lower() in ("editor", "active_document", "current", "active")
+            if not generic:
+                candidates = [c for c in candidates if field.casefold() in
+                              f"{c.Name} {c.AutomationId}".casefold()]
+            else:
+                # A menu/search box must not steal an editor-directed write.
+                candidates = [c for c in candidates if not any(word in
+                              f"{c.Name} {c.AutomationId}".lower() for word in ("search", "find", "address"))]
+            focused = [c for c in candidates if c.HasKeyboardFocus]
+            selected = focused[0] if len(focused) == 1 else (candidates[0] if len(candidates) == 1 else None)
+            if selected is None:
+                return False
+            selected.SetFocus()
+            return bool(selected.HasKeyboardFocus)
+        except Exception as exc:
+            logger.debug("Could not focus editable control: %s", exc)
+            return False
+
+    @_uia_thread
+    def read_focused_text(self) -> Optional[str]:
+        if not HAS_UIA:
+            return None
+        try:
+            ctrl = auto.GetFocusedControl()
+            if not self._editable_control(ctrl):
+                return None
+            try:
+                pattern = ctrl.GetValuePattern()
+                if pattern:
+                    return pattern.Value
+            except Exception:
+                pass
+            pattern = ctrl.GetTextPattern()
+            if pattern:
+                return pattern.DocumentRange.GetText(-1)
+        except Exception as exc:
+            logger.debug("Could not read focused text: %s", exc)
+        return None
+
+    def check_emergency_stop(self) -> None:
+        # Native Win32 keyboard calls do not run PyAutoGUI's decorator checks.
+        pyautogui.failSafeCheck()
+
+    @_uia_thread
+    def has_unexpected_modal(self) -> Optional[bool]:
+        if not HAS_UIA:
+            return None
+        try:
+            foreground = auto.GetForegroundControl()
+            pattern = foreground.GetWindowPattern()
+            return bool(pattern and pattern.IsModal) or foreground.ClassName == "#32770"
+        except Exception:
+            return None
